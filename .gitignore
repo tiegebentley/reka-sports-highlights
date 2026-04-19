@@ -1,0 +1,33 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+supabase/.env
+
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Build outputs
+frontend/dist/
+frontend/build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Supabase
+.branches/
+supabase/.temp/
+
+# Test files
+test-*.ts
+*.test.ts

@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Trigger Poll Jobs</title>
+</head>
+<body>
+    <h1>Trigger Poll Jobs</h1>
+    <button id="pollBtn">Poll Clip Jobs</button>
+    <pre id="result"></pre>
+    
+    <script type="module">
+        import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+        
+        const supabase = createClient(
+            'https://nxllstmdmqcaiodoensd.supabase.co',
+            'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im54bGxzdG1kbXFjYWlvZG9lbnNkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ3Mjk1MTEsImV4cCI6MjA2MDMwNTUxMX0.QxkYVdxXqPYKp-UfU5tQf7hQBNw1-hJe_b4UYP7s2yA'
+        )
+        
+        document.getElementById('pollBtn').onclick = async () => {
+            const resultEl = document.getElementById('result')
+            resultEl.textContent = 'Polling...'
+            
+            try {
+                const { data, error } = await supabase.functions.invoke('poll-clip-jobs')
+                
+                if (error) {
+                    resultEl.textContent = 'Error: ' + JSON.stringify(error, null, 2)
+                } else {
+                    resultEl.textContent = JSON.stringify(data, null, 2)
+                }
+            } catch (err) {
+                resultEl.textContent = 'Exception: ' + err.message
+            }
+        }
+    </script>
+</body>
+</html>
