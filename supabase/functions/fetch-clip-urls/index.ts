@@ -79,14 +79,17 @@ serve(async (req) => {
 
       console.log(`Updating clip ${i + 1}/${clipStatus.output.length}:`, {
         clipId,
-        clip_url: rekaClip.clip_url,
-        title: rekaClip.title
+        video_url: rekaClip.video_url,
+        clip_url: rekaClip.video_url,  // Store in clip_url column
+        title: rekaClip.title,
+        ai_score: rekaClip.ai_score
       })
 
       const { data: updateData, error: updateError } = await supabase
         .from('clips')
         .update({
-          clip_url: rekaClip.clip_url,
+          clip_url: rekaClip.video_url,  // Reka API returns video_url
+          quality_score: rekaClip.ai_score,  // Reka API returns ai_score
         })
         .eq('id', clipId)
         .select()
@@ -95,7 +98,7 @@ serve(async (req) => {
         console.error(`ERROR updating clip ${clipId}:`, updateError)
       } else {
         console.log(`SUCCESS updating clip ${clipId}:`, updateData)
-        updates.push({ clipId, clip_url: rekaClip.clip_url })
+        updates.push({ clipId, clip_url: rekaClip.video_url })
       }
     }
 

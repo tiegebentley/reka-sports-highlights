@@ -18,11 +18,11 @@ export interface RekaClipResponse {
   id: string
   status: 'queued' | 'processing' | 'completed' | 'failed'
   output?: {
-    clip_url: string
+    video_url: string  // Reka uses video_url, not clip_url
     title: string
     caption: string
     hashtags: string[]
-    quality_score: number
+    ai_score: number  // Reka uses ai_score, not quality_score
   }[]
   error?: string
 }

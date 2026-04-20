@@ -64,11 +64,11 @@ serve(async (req) => {
               video_id: job.video_id,
               user_id: job.user_id,
               reka_clip_id: rekaClipId,
-              clip_url: clip.clip_url,
+              clip_url: clip.video_url,  // Reka returns video_url
               title: clip.title,
               caption: clip.caption,
               hashtags: clip.hashtags,
-              quality_score: clip.quality_score,
+              quality_score: clip.ai_score,  // Reka returns ai_score
             })
           }
 
