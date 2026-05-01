@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { PlayerStatsCard } from '../components/stats/PlayerStatsCard';
 import { HeatmapVisualizer } from '../components/stats/HeatmapVisualizer';
-import { PlayerStats, PlayerHeatmap } from '../types/stats';
+import type { PlayerStats, PlayerHeatmap } from '../types/stats';
 
 export const StatsDemo = () => {
   const [selectedView, setSelectedView] = useState<'stats' | 'heatmap' | 'both'>('both');

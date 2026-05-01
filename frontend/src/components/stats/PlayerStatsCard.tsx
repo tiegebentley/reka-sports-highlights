@@ -1,4 +1,5 @@
-import { PlayerStats, formatStatValue, calculatePlayerRating } from '../../types/stats';
+import type { PlayerStats } from '../../types/stats';
+import { formatStatValue, calculatePlayerRating } from '../../types/stats';
 
 interface PlayerStatsCardProps {
   playerStats: PlayerStats;

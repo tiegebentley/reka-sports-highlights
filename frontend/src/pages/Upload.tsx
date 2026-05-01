@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from 'react'
-import { Upload as UploadIcon, Link as LinkIcon, Loader2, CheckCircle, AlertCircle, X, FileVideo, Info } from 'lucide-react'
+import { Upload as UploadIcon, Link as LinkIcon, Loader2, CheckCircle, AlertCircle, X, FileVideo, Info, Sparkles, Scissors as ScissorsIcon } from 'lucide-react'
 import { supabase } from '../lib/supabase'
 import { getVideoMetadata, estimateProcessingTime, formatBytes, formatTime } from '../lib/videoPreprocessing'
+import type { ProcessingMode, AspectRatio } from '../types'
 
 type UploadMethod = 'file' | 'url' | 'batch'
 type UploadStatus = 'idle' | 'uploading' | 'success' | 'error'
@@ -35,6 +36,8 @@ export function Upload() {
   const [analyzingVideo, setAnalyzingVideo] = useState(false)
   const [batchFiles, setBatchFiles] = useState<BatchFile[]>([])
   const [authDebug, setAuthDebug] = useState<string>('')
+  const [processingMode, setProcessingMode] = useState<ProcessingMode>('sports_analysis')
+  const [aspectRatio, setAspectRatio] = useState<AspectRatio>('9:16')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const batchInputRef = useRef<HTMLInputElement>(null)
 
@@ -136,6 +139,8 @@ export function Upload() {
               title: batchFile.title,
               sourceType: 'upload',
               fileName: batchFile.file.name,
+              processingMode,
+              aspectRatio: processingMode === 'short_form' ? aspectRatio : '9:16',
             },
           })
 
@@ -236,6 +241,8 @@ export function Upload() {
           title,
           sourceType: 'upload',
           fileName: selectedFile.name,
+          processingMode,
+          aspectRatio: processingMode === 'short_form' ? aspectRatio : '9:16',
         },
       })
 
@@ -332,6 +339,8 @@ export function Upload() {
           title,
           sourceType,
           sourceUrl: videoUrl,
+          processingMode,
+          aspectRatio: processingMode === 'short_form' ? aspectRatio : '9:16',
         },
       })
 
@@ -484,6 +493,95 @@ export function Upload() {
                 className="w-full rounded-md border border-input bg-background px-3 py-2"
               />
             </div>
+
+            {/* Processing Mode Selector */}
+            <div>
+              <label className="block text-sm font-medium mb-3">Processing Mode</label>
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => setProcessingMode('sports_analysis')}
+                  className={`relative rounded-lg border-2 p-4 text-left transition-all ${
+                    processingMode === 'sports_analysis'
+                      ? 'border-primary bg-primary/5'
+                      : 'border-border hover:border-primary/50'
+                  }`}
+                >
+                  <div className="flex items-start gap-3">
+                    <Sparkles className={`w-5 h-5 mt-0.5 ${
+                      processingMode === 'sports_analysis' ? 'text-primary' : 'text-muted-foreground'
+                    }`} />
+                    <div className="flex-1">
+                      <h4 className="font-semibold text-sm mb-1">Sports Analysis</h4>
+                      <p className="text-xs text-muted-foreground">
+                        AI automatically detects player moments, key highlights, and game events
+                      </p>
+                    </div>
+                  </div>
+                  {processingMode === 'sports_analysis' && (
+                    <div className="absolute top-2 right-2">
+                      <CheckCircle className="w-4 h-4 text-primary fill-current" />
+                    </div>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setProcessingMode('short_form')}
+                  className={`relative rounded-lg border-2 p-4 text-left transition-all ${
+                    processingMode === 'short_form'
+                      ? 'border-primary bg-primary/5'
+                      : 'border-border hover:border-primary/50'
+                  }`}
+                >
+                  <div className="flex items-start gap-3">
+                    <ScissorsIcon className={`w-5 h-5 mt-0.5 ${
+                      processingMode === 'short_form' ? 'text-primary' : 'text-muted-foreground'
+                    }`} />
+                    <div className="flex-1">
+                      <h4 className="font-semibold text-sm mb-1">Short-form Clipping</h4>
+                      <p className="text-xs text-muted-foreground">
+                        Manual segment selection with captions and custom aspect ratios
+                      </p>
+                    </div>
+                  </div>
+                  {processingMode === 'short_form' && (
+                    <div className="absolute top-2 right-2">
+                      <CheckCircle className="w-4 h-4 text-primary fill-current" />
+                    </div>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {/* Aspect Ratio Selector (only for short-form mode) */}
+            {processingMode === 'short_form' && (
+              <div>
+                <label className="block text-sm font-medium mb-2">Aspect Ratio</label>
+                <div className="grid grid-cols-4 gap-2">
+                  {(['1:1', '4:5', '9:16', '16:9'] as AspectRatio[]).map((ratio) => (
+                    <button
+                      key={ratio}
+                      type="button"
+                      onClick={() => setAspectRatio(ratio)}
+                      className={`rounded-md border-2 px-3 py-2 text-sm font-medium transition-all ${
+                        aspectRatio === ratio
+                          ? 'border-primary bg-primary text-primary-foreground'
+                          : 'border-border hover:border-primary/50'
+                      }`}
+                    >
+                      {ratio}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-muted-foreground mt-2">
+                  {aspectRatio === '1:1' && '• Square - Instagram posts'}
+                  {aspectRatio === '4:5' && '• Portrait - Instagram feed'}
+                  {aspectRatio === '9:16' && '• Vertical - Stories, Reels, TikTok'}
+                  {aspectRatio === '16:9' && '• Landscape - YouTube, Twitter'}
+                </p>
+              </div>
+            )}
 
             <button
               onClick={handleFileUpload}

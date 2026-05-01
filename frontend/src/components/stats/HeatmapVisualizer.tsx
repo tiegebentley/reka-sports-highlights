@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { PlayerHeatmap } from '../../types/stats';
+import type { PlayerHeatmap } from '../../types/stats';
 
 interface HeatmapVisualizerProps {
   heatmap: PlayerHeatmap;

@@ -18,6 +18,8 @@ import {
 
 type VideoStatus = 'uploaded' | 'processing' | 'completed' | 'failed'
 type SourceType = 'upload' | 'youtube' | 'twitch'
+type ProcessingMode = 'sports_analysis' | 'short_form'
+type AspectRatio = '1:1' | '4:5' | '9:16' | '16:9'
 
 interface VideoRecord {
   id: string
@@ -29,6 +31,7 @@ interface VideoRecord {
   duration_seconds: number | null
   resolution: string | null
   status: VideoStatus
+  processing_mode: ProcessingMode // NEW: determines clip generation workflow
   created_at: string
   updated_at: string
 }
@@ -45,8 +48,11 @@ interface ClipRecord {
   quality_score: number | null
   start_time: number | null
   end_time: number | null
-  aspect_ratio: string | null
+  aspect_ratio: AspectRatio | null
   resolution: string | null
+  processing_mode: ProcessingMode // NEW: sports_analysis or short_form
+  segment_start: number | null // NEW: for short_form mode manual selection
+  segment_end: number | null // NEW: for short_form mode manual selection
   created_at: string
 }
 
