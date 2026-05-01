@@ -6,6 +6,8 @@ interface UploadVideoRequest {
   sourceType: 'upload' | 'youtube' | 'twitch'
   sourceUrl?: string
   fileName?: string
+  processingMode?: 'sports_analysis' | 'short_form'
+  aspectRatio?: '1:1' | '4:5' | '9:16' | '16:9'
 }
 
 serve(async (req) => {
@@ -67,11 +69,15 @@ serve(async (req) => {
       )
     }
 
-    const { title, sourceType, sourceUrl, fileName }: UploadVideoRequest = await req.json()
+    const { title, sourceType, sourceUrl, fileName, processingMode, aspectRatio }: UploadVideoRequest = await req.json()
 
     if (!title || !sourceType) {
       throw new Error('Missing required fields: title, sourceType')
     }
+
+    // Set defaults for new fields
+    const finalProcessingMode = processingMode || 'sports_analysis'
+    const finalAspectRatio = aspectRatio || '9:16'
 
     // Validate based on source type
     if (sourceType !== 'upload' && !sourceUrl) {
@@ -120,6 +126,7 @@ serve(async (req) => {
       source_url: videoUrl,
       storage_path: storagePath,
       status: 'uploaded',
+      processing_mode: finalProcessingMode,
     })
 
     const { data: video, error: videoError } = await supabase
@@ -131,6 +138,7 @@ serve(async (req) => {
         source_url: videoUrl,
         storage_path: storagePath,
         status: 'uploaded',
+        processing_mode: finalProcessingMode,
       })
       .select()
       .single()
@@ -143,6 +151,7 @@ serve(async (req) => {
     console.log(`[Video ${video.id}] Created for user ${user.id}`)
 
     // For URL-based videos (YouTube/Twitch), create initial job
+    // Store processing mode in job metadata for later use
     if (sourceType !== 'upload') {
       await supabase.from('jobs').insert({
         user_id: user.id,
@@ -150,6 +159,10 @@ serve(async (req) => {
         job_type: 'clip_generation',
         status: 'queued',
         progress: 0,
+        result: {
+          processingMode: finalProcessingMode,
+          aspectRatio: finalAspectRatio,
+        },
       })
     }
 
@@ -162,6 +175,8 @@ serve(async (req) => {
           sourceType: video.source_type,
           sourceUrl: video.source_url,
           status: video.status,
+          processingMode: finalProcessingMode,
+          aspectRatio: finalAspectRatio,
         },
         // For uploads, include the signed URL
         ...(sourceType === 'upload' && {

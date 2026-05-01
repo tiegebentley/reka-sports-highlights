@@ -10,6 +10,9 @@ interface GenerateClipsRequest {
     aspect_ratio?: '9:16' | '16:9' | '4:5' | '1:1'
     resolution?: number
     prompt?: string
+    // For short-form mode: manual segment selection
+    segment_start?: number
+    segment_end?: number
   }
 }
 
@@ -105,17 +108,36 @@ serve(async (req) => {
       throw new Error('Video has no valid URL or storage path')
     }
 
-    // Generate clips with Reka
-    const clipRequest = {
-      video_urls: [videoUrl],
-      template: settings?.template || 'moments',
-      num_generations: Math.min(settings?.num_clips || 3, 3), // Max 3
-      aspect_ratio: settings?.aspect_ratio || '9:16',
-      resolution: settings?.resolution || 720,
-      prompt: settings?.prompt,
+    // Get processing mode from video (defaults to sports_analysis for backward compatibility)
+    const processingMode = video.processing_mode || 'sports_analysis'
+
+    // Determine aspect ratio based on mode and settings
+    let aspectRatio = settings?.aspect_ratio || '9:16'
+    if (processingMode === 'short_form' && !settings?.aspect_ratio) {
+      // For short-form without explicit settings, this will be set per-clip by the frontend
+      aspectRatio = '9:16' // default
     }
 
-    console.log('[Reka] Sending clip generation request:', clipRequest)
+    // Generate clips with Reka
+    const clipRequest: any = {
+      video_urls: [videoUrl],
+      template: processingMode === 'sports_analysis' ? (settings?.template || 'moments') : 'moments',
+      num_generations: Math.min(settings?.num_clips || 3, 3), // Max 3
+      aspect_ratio: aspectRatio,
+      resolution: settings?.resolution || 720,
+      prompt: settings?.prompt || (processingMode === 'sports_analysis'
+        ? 'Detect key moments, player highlights, and important game events'
+        : undefined),
+    }
+
+    // For short-form mode with manual segment selection
+    if (processingMode === 'short_form' && settings?.segment_start !== undefined && settings?.segment_end !== undefined) {
+      clipRequest.source_start_time = settings.segment_start
+      clipRequest.source_end_time = settings.segment_end
+      console.log(`[Short-form] Using segment: ${settings.segment_start}s - ${settings.segment_end}s`)
+    }
+
+    console.log(`[Reka] Sending clip generation request (${processingMode} mode):`, clipRequest)
 
     const clipResponse = await rekaClient.generateClips(clipRequest)
 

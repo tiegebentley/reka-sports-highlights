@@ -22,10 +22,10 @@ serve(async (req) => {
     const supabase = createClient(supabaseUrl, supabaseServiceKey)
     const rekaClient = new RekaClient(rekaApiKey)
 
-    // Get all processing/queued jobs
+    // Get all processing/queued jobs with video data
     const { data: jobs, error: jobsError } = await supabase
       .from('jobs')
-      .select('*')
+      .select('*, videos(*)')
       .in('status', ['queued', 'processing'])
       .eq('job_type', 'clip_generation')
 
@@ -59,6 +59,13 @@ serve(async (req) => {
           // Extract clips and save to database
           const clips = clipStatus.output || []
 
+          // Get processing mode from video
+          const video = job.videos
+          const processingMode = video?.processing_mode || 'sports_analysis'
+          const aspectRatio = job.result?.aspectRatio || '9:16'
+          const segmentStart = job.metadata?.settings?.segment_start
+          const segmentEnd = job.metadata?.settings?.segment_end
+
           for (const clip of clips) {
             await supabase.from('clips').insert({
               video_id: job.video_id,
@@ -69,6 +76,10 @@ serve(async (req) => {
               caption: clip.caption,
               hashtags: clip.hashtags,
               quality_score: clip.ai_score,  // Reka returns ai_score
+              processing_mode: processingMode,
+              aspect_ratio: aspectRatio,
+              segment_start: segmentStart,
+              segment_end: segmentEnd,
             })
           }
 
