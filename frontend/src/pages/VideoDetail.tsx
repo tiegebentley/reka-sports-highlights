@@ -14,7 +14,28 @@ import {
   AlertCircle,
   CheckCircle2,
   ExternalLink,
+  Pencil,
+  Check,
+  X,
 } from 'lucide-react'
+
+// Soccer event taxonomy. Each tag has a label + Tailwind colour token used
+// for both the pill and the filter chip. Keep in sync with
+// supabase/functions/_shared/extract-tags.ts.
+const SOCCER_TAGS = [
+  { id: 'goal',           label: 'Goal',           cls: 'bg-emerald-100 text-emerald-800 border-emerald-200' },
+  { id: 'shot',           label: 'Shot',           cls: 'bg-sky-100 text-sky-800 border-sky-200' },
+  { id: 'shot_on_target', label: 'On Target',      cls: 'bg-blue-100 text-blue-800 border-blue-200' },
+  { id: 'save',           label: 'Save',           cls: 'bg-violet-100 text-violet-800 border-violet-200' },
+  { id: 'corner',         label: 'Corner',         cls: 'bg-cyan-100 text-cyan-800 border-cyan-200' },
+  { id: 'kickoff',        label: 'Kickoff',        cls: 'bg-slate-100 text-slate-800 border-slate-200' },
+  { id: 'yellow_card',    label: 'Yellow Card',    cls: 'bg-yellow-100 text-yellow-800 border-yellow-300' },
+  { id: 'red_card',       label: 'Red Card',       cls: 'bg-red-100 text-red-800 border-red-300' },
+  { id: 'foul',           label: 'Foul',           cls: 'bg-orange-100 text-orange-800 border-orange-200' },
+  { id: 'penalty',        label: 'Penalty',        cls: 'bg-fuchsia-100 text-fuchsia-800 border-fuchsia-200' },
+] as const
+
+const TAG_BY_ID = Object.fromEntries(SOCCER_TAGS.map(t => [t.id, t]))
 
 type VideoStatus = 'uploaded' | 'processing' | 'completed' | 'failed'
 type SourceType = 'upload' | 'youtube' | 'twitch'
@@ -45,6 +66,7 @@ interface ClipRecord {
   title: string | null
   caption: string | null
   hashtags: string[] | null
+  tags: string[] | null
   quality_score: number | null
   start_time: number | null
   end_time: number | null
@@ -80,6 +102,61 @@ export function VideoDetail() {
   const [error, setError] = useState<string | null>(null)
   const [generatingClips, setGeneratingClips] = useState(false)
   const [polling, setPolling] = useState(false)
+  const [tagFilter, setTagFilter] = useState<Set<string>>(new Set())
+  const [editingTagsFor, setEditingTagsFor] = useState<string | null>(null)
+  const [editingTagsDraft, setEditingTagsDraft] = useState<Set<string>>(new Set())
+
+  const toggleTagFilter = (tagId: string) => {
+    setTagFilter(prev => {
+      const next = new Set(prev)
+      if (next.has(tagId)) next.delete(tagId)
+      else next.add(tagId)
+      return next
+    })
+  }
+
+  const startEditingTags = (clip: ClipRecord) => {
+    setEditingTagsFor(clip.id)
+    setEditingTagsDraft(new Set(clip.tags ?? []))
+  }
+
+  const toggleDraftTag = (tagId: string) => {
+    setEditingTagsDraft(prev => {
+      const next = new Set(prev)
+      if (next.has(tagId)) next.delete(tagId)
+      else next.add(tagId)
+      return next
+    })
+  }
+
+  const saveTags = async (clipId: string) => {
+    const nextTags = SOCCER_TAGS.filter(t => editingTagsDraft.has(t.id)).map(t => t.id)
+    const { error: saveErr } = await supabase
+      .from('clips')
+      .update({ tags: nextTags })
+      .eq('id', clipId)
+    if (saveErr) {
+      console.error('Failed to save tags:', saveErr.message)
+      return
+    }
+    setClips(prev => prev.map(c => c.id === clipId ? { ...c, tags: nextTags } : c))
+    setEditingTagsFor(null)
+  }
+
+  const cancelEditingTags = () => {
+    setEditingTagsFor(null)
+    setEditingTagsDraft(new Set())
+  }
+
+  // Apply filter: clip passes if it carries every active filter tag (AND match).
+  // Empty filter shows everything.
+  const filteredClips = tagFilter.size === 0
+    ? clips
+    : clips.filter(c => {
+        const ct = c.tags ?? []
+        for (const t of tagFilter) if (!ct.includes(t)) return false
+        return true
+      })
 
   useEffect(() => {
     if (videoId) {
@@ -490,8 +567,42 @@ export function VideoDetail() {
                 </p>
               </div>
             ) : (
+              <>
+                {/* Filter chips — multi-select; AND semantics. */}
+                <div className="flex flex-wrap items-center gap-2 mb-4">
+                  <span className="text-xs text-muted-foreground mr-1">Filter:</span>
+                  {SOCCER_TAGS.map(t => {
+                    const active = tagFilter.has(t.id)
+                    const count = clips.filter(c => (c.tags ?? []).includes(t.id)).length
+                    if (count === 0 && !active) return null
+                    return (
+                      <button
+                        key={t.id}
+                        onClick={() => toggleTagFilter(t.id)}
+                        className={`text-xs px-2 py-1 rounded border transition-opacity ${t.cls} ${active ? 'opacity-100 ring-2 ring-offset-1 ring-current' : 'opacity-70 hover:opacity-100'}`}
+                      >
+                        {t.label} <span className="opacity-60">({count})</span>
+                      </button>
+                    )
+                  })}
+                  {tagFilter.size > 0 && (
+                    <button
+                      onClick={() => setTagFilter(new Set())}
+                      className="text-xs text-muted-foreground hover:text-foreground underline ml-1"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+
+                {filteredClips.length === 0 && (
+                  <p className="text-sm text-muted-foreground italic mb-4">
+                    No clips match the selected filters.
+                  </p>
+                )}
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {clips.map((clip) => (
+                {filteredClips.map((clip) => (
                   <div key={clip.id} className="rounded-lg border bg-muted/50 overflow-hidden">
                     <div className="aspect-video bg-muted flex items-center justify-center">
                       {clip.clip_url ? (
@@ -521,35 +632,90 @@ export function VideoDetail() {
                       )}
                     </div>
                     <div className="p-4">
-                      <h3 className="font-semibold text-sm mb-2">{clip.title || 'Untitled Clip'}</h3>
-                      {clip.caption && (
-                        <p className="text-xs text-muted-foreground mb-2">{clip.caption}</p>
-                      )}
-                      {clip.quality_score && (
-                        <div className="text-xs text-muted-foreground mb-2">
-                          Quality: {clip.quality_score}/100
+                      <div className="flex items-start justify-between gap-2 mb-3">
+                        <h3 className="font-semibold text-sm flex-1">{clip.title || 'Untitled Clip'}</h3>
+                        {clip.quality_score != null && (
+                          <span className="text-xs text-muted-foreground whitespace-nowrap">
+                            {clip.quality_score}/100
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Event tags — pills replace caption/hashtags as primary metadata. */}
+                      {editingTagsFor === clip.id ? (
+                        <div className="mb-3">
+                          <div className="flex flex-wrap gap-1 mb-2">
+                            {SOCCER_TAGS.map(t => {
+                              const on = editingTagsDraft.has(t.id)
+                              return (
+                                <button
+                                  key={t.id}
+                                  onClick={() => toggleDraftTag(t.id)}
+                                  className={`text-xs px-2 py-1 rounded border transition-opacity ${t.cls} ${on ? 'opacity-100' : 'opacity-40 hover:opacity-70'}`}
+                                >
+                                  {t.label}
+                                </button>
+                              )
+                            })}
+                          </div>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => saveTags(clip.id)}
+                              className="flex-1 text-xs rounded-md bg-primary px-2 py-1.5 font-medium text-primary-foreground hover:bg-primary/90 flex items-center justify-center gap-1"
+                            >
+                              <Check className="w-3 h-3" />
+                              Save
+                            </button>
+                            <button
+                              onClick={cancelEditingTags}
+                              className="flex-1 text-xs rounded-md border border-input bg-background px-2 py-1.5 font-medium hover:bg-muted flex items-center justify-center gap-1"
+                            >
+                              <X className="w-3 h-3" />
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap items-center gap-1 mb-3">
+                          {(clip.tags && clip.tags.length > 0) ? (
+                            clip.tags.map(tagId => {
+                              const t = TAG_BY_ID[tagId]
+                              if (!t) return null
+                              return (
+                                <span key={tagId} className={`text-xs px-2 py-1 rounded border ${t.cls}`}>
+                                  {t.label}
+                                </span>
+                              )
+                            })
+                          ) : (
+                            <span className="text-xs text-muted-foreground italic">No tags</span>
+                          )}
+                          <button
+                            onClick={() => startEditingTags(clip)}
+                            className="ml-auto text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
+                          >
+                            <Pencil className="w-3 h-3" />
+                            Edit
+                          </button>
                         </div>
                       )}
-                      {clip.hashtags && clip.hashtags.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mb-3">
-                          {clip.hashtags.map((tag, i) => (
-                            <span key={i} className="text-xs bg-primary/10 text-primary px-2 py-1 rounded">
-                              {tag}
-                            </span>
-                          ))}
-                        </div>
+
+                      {/* Caption/hashtags collapsed by default — tags carry the meaning now. */}
+                      {(clip.caption || (clip.hashtags && clip.hashtags.length > 0)) && (
+                        <details className="text-xs text-muted-foreground mb-3">
+                          <summary className="cursor-pointer hover:text-foreground">Show AI description</summary>
+                          {clip.caption && <p className="mt-2">{clip.caption}</p>}
+                          {clip.hashtags && clip.hashtags.length > 0 && (
+                            <div className="flex flex-wrap gap-1 mt-2">
+                              {clip.hashtags.map((tag, i) => (
+                                <span key={i} className="text-[10px] bg-muted px-1.5 py-0.5 rounded">
+                                  {tag}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </details>
                       )}
-                      {/* Debug info */}
-                      <details className="text-xs text-muted-foreground mb-3">
-                        <summary className="cursor-pointer hover:text-foreground">Debug Info</summary>
-                        <pre className="mt-2 p-2 bg-muted rounded text-[10px] overflow-auto max-h-32">
-                          {JSON.stringify({
-                            id: clip.id,
-                            clip_url: clip.clip_url,
-                            reka_clip_id: clip.reka_clip_id
-                          }, null, 2)}
-                        </pre>
-                      </details>
                       <div className="flex gap-2">
                         {clip.clip_url ? (
                           <>
@@ -578,6 +744,7 @@ export function VideoDetail() {
                   </div>
                 ))}
               </div>
+              </>
             )}
           </div>
         </div>

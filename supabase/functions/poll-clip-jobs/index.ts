@@ -1,6 +1,7 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 import { RekaClient } from '../_shared/reka-client.ts'
+import { extractSoccerTags } from '../_shared/extract-tags.ts'
 
 serve(async (req) => {
   // Handle CORS
@@ -88,6 +89,11 @@ serve(async (req) => {
           const segmentEnd = job.metadata?.settings?.segment_end
 
           for (const clip of clips) {
+            const tags = extractSoccerTags({
+              title: clip.title,
+              caption: clip.caption,
+              hashtags: clip.hashtags,
+            })
             await supabase.from('clips').insert({
               video_id: job.video_id,
               user_id: job.user_id,
@@ -96,6 +102,7 @@ serve(async (req) => {
               title: clip.title,
               caption: clip.caption,
               hashtags: clip.hashtags,
+              tags,
               quality_score: clip.ai_score,  // Reka returns ai_score
               processing_mode: processingMode,
               aspect_ratio: aspectRatio,
