@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# ffmpeg-wasm core copied from node_modules by postinstall script
+public/ffmpeg/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

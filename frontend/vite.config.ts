@@ -12,5 +12,13 @@ export default defineConfig({
   },
   server: {
     port: 5175,
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'credentialless',
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+    },
+  },
+  optimizeDeps: {
+    exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
   },
 })

@@ -105,6 +105,13 @@ export function VideoDetail() {
   const [tagFilter, setTagFilter] = useState<Set<string>>(new Set())
   const [editingTagsFor, setEditingTagsFor] = useState<string | null>(null)
   const [editingTagsDraft, setEditingTagsDraft] = useState<Set<string>>(new Set())
+  const [analyzingEvents, setAnalyzingEvents] = useState(false)
+  const [analyzeEventsResult, setAnalyzeEventsResult] = useState<{
+    events: Array<{ type: string; start: number; end: number; description: string; confidence: number }>
+    rawResponse?: string
+    error?: string
+    rekaVideoId?: string
+  } | null>(null)
 
   const toggleTagFilter = (tagId: string) => {
     setTagFilter(prev => {
@@ -266,6 +273,43 @@ export function VideoDetail() {
       alert(`Failed to generate clips: ${err.message}`)
     } finally {
       setGeneratingClips(false)
+    }
+  }
+
+  const handleAnalyzeEvents = async () => {
+    if (!video) return
+    setAnalyzingEvents(true)
+    setAnalyzeEventsResult(null)
+    try {
+      const { data, error: analyzeError } = await supabase.functions.invoke('analyze-events', {
+        body: { videoId: video.id },
+      })
+      if (analyzeError) {
+        // The supabase JS client wraps non-2xx responses; the body is on error.context
+        let bodyText = ''
+        try {
+          if (analyzeError.context?.json) {
+            const body = await analyzeError.context.json()
+            bodyText = body?.error || JSON.stringify(body)
+          } else if (analyzeError.context?.text) {
+            bodyText = await analyzeError.context.text()
+          }
+        } catch {
+          bodyText = ''
+        }
+        throw new Error(bodyText || analyzeError.message || 'Edge function error')
+      }
+      if (!data?.ok) throw new Error(data?.error || 'Unknown error')
+      setAnalyzeEventsResult({
+        events: data.events || [],
+        rawResponse: data.rawResponse,
+        rekaVideoId: data.rekaVideoId,
+      })
+    } catch (err: any) {
+      console.error('Error analyzing events:', err)
+      setAnalyzeEventsResult({ events: [], error: err.message || String(err) })
+    } finally {
+      setAnalyzingEvents(false)
     }
   }
 
@@ -510,6 +554,24 @@ export function VideoDetail() {
                     )}
                   </button>
                 )}
+                <button
+                  onClick={handleAnalyzeEvents}
+                  disabled={analyzingEvents}
+                  className="flex-1 rounded-md border border-input bg-background px-4 py-3 text-sm font-medium hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  title="Beta: ask Reka Q&A to list every event with timestamps. No clipping yet — verifies if Reka returns usable data."
+                >
+                  {analyzingEvents ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Analyzing...
+                    </>
+                  ) : (
+                    <>
+                      <PlayCircle className="w-4 h-4" />
+                      List Events (Beta)
+                    </>
+                  )}
+                </button>
                 {hasActiveJobs && (
                   <button
                     onClick={handlePollJobs}
@@ -532,6 +594,78 @@ export function VideoDetail() {
               </div>
             </div>
           </div>
+
+          {/* Analyze Events (Beta) Result Panel */}
+          {analyzeEventsResult && (
+            <div className="rounded-lg border bg-card p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-xl font-semibold">
+                  Detected Events {analyzeEventsResult.events.length > 0 && `(${analyzeEventsResult.events.length})`}
+                </h2>
+                {analyzeEventsResult.rekaVideoId && (
+                  <span className="text-xs text-muted-foreground">Reka video_id: {analyzeEventsResult.rekaVideoId}</span>
+                )}
+              </div>
+              {analyzeEventsResult.error ? (
+                <div className="rounded-md bg-destructive/10 border border-destructive/20 p-4 text-sm text-destructive flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <p className="font-medium mb-1">Analysis failed</p>
+                    <p className="font-mono text-xs whitespace-pre-wrap">{analyzeEventsResult.error}</p>
+                  </div>
+                </div>
+              ) : analyzeEventsResult.events.length === 0 ? (
+                <div className="space-y-3">
+                  <p className="text-sm text-muted-foreground">
+                    No events parsed from response. Reka may have returned non-JSON output. Raw response:
+                  </p>
+                  <pre className="text-xs bg-muted p-3 rounded overflow-auto max-h-64">{analyzeEventsResult.rawResponse}</pre>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left border-b">
+                          <th className="py-2 pr-3">Type</th>
+                          <th className="py-2 pr-3">Start</th>
+                          <th className="py-2 pr-3">End</th>
+                          <th className="py-2 pr-3">Duration</th>
+                          <th className="py-2 pr-3">Confidence</th>
+                          <th className="py-2 pr-3">Description</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {analyzeEventsResult.events.map((evt, i) => {
+                          const tag = TAG_BY_ID[evt.type as keyof typeof TAG_BY_ID]
+                          return (
+                            <tr key={i} className="border-b last:border-0">
+                              <td className="py-2 pr-3">
+                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs border ${tag?.cls || 'bg-muted text-muted-foreground border-border'}`}>
+                                  {tag?.label || evt.type}
+                                </span>
+                              </td>
+                              <td className="py-2 pr-3 font-mono text-xs">{evt.start.toFixed(1)}s</td>
+                              <td className="py-2 pr-3 font-mono text-xs">{evt.end.toFixed(1)}s</td>
+                              <td className="py-2 pr-3 font-mono text-xs">{(evt.end - evt.start).toFixed(1)}s</td>
+                              <td className="py-2 pr-3 font-mono text-xs">{(evt.confidence * 100).toFixed(0)}%</td>
+                              <td className="py-2 pr-3 text-xs">{evt.description}</td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <details className="mt-4">
+                    <summary className="text-xs text-muted-foreground cursor-pointer hover:text-foreground">
+                      View raw Reka response
+                    </summary>
+                    <pre className="text-xs bg-muted p-3 rounded overflow-auto max-h-64 mt-2">{analyzeEventsResult.rawResponse}</pre>
+                  </details>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Clips Grid */}
           <div className="rounded-lg border bg-card p-6">

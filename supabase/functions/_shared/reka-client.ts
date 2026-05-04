@@ -101,4 +101,105 @@ export class RekaClient {
 
     throw new Error(`Clip generation timeout after ${maxAttempts} attempts`)
   }
+
+  /**
+   * Upload + index a video for Q&A. Reka /v1/videos/upload requires multipart
+   * form-data with `index` as a form field and the video URL or file in another field.
+   * Try multiple URL field names since docs are unclear.
+   */
+  async uploadVideoForIndexing(videoUrl: string): Promise<{ videoId: string; raw: any }> {
+    const url = `${this.baseUrl}/v1/videos/upload`
+
+    const attempts: Array<{ label: string; build: () => FormData }> = [
+      { label: 'multipart video_url+index=true', build: () => {
+        const fd = new FormData()
+        fd.append('video_url', videoUrl)
+        fd.append('index', 'true')
+        return fd
+      }},
+      { label: 'multipart url+index=true', build: () => {
+        const fd = new FormData()
+        fd.append('url', videoUrl)
+        fd.append('index', 'true')
+        return fd
+      }},
+      { label: 'json {url, index:true}', build: () => {
+        // Some Reka endpoints accept JSON; fall through to a raw JSON attempt
+        const fd = new FormData()
+        ;(fd as any).__json = { url: videoUrl, index: true }
+        return fd
+      }},
+      { label: 'json {video_url, index:true}', build: () => {
+        const fd = new FormData()
+        ;(fd as any).__json = { video_url: videoUrl, index: true }
+        return fd
+      }},
+    ]
+
+    const allErrors: string[] = []
+    for (const attempt of attempts) {
+      const fd = attempt.build()
+      const isJson = (fd as any).__json
+      const response = isJson
+        ? await fetch(url, {
+            method: 'POST',
+            headers: { 'X-Api-Key': this.apiKey, 'Content-Type': 'application/json' },
+            body: JSON.stringify(isJson),
+          })
+        : await fetch(url, {
+            method: 'POST',
+            headers: { 'X-Api-Key': this.apiKey }, // let fetch set multipart boundary
+            body: fd,
+          })
+      const text = await response.text()
+      if (response.ok) {
+        let parsed: any = {}
+        try { parsed = JSON.parse(text) } catch { /* */ }
+        const videoId = parsed.video_id || parsed.id || parsed._id || parsed.uuid
+        if (!videoId) throw new Error(`Reka upload succeeded but response has no id field: ${text}`)
+        console.log(`[Reka] Upload succeeded with body shape: ${attempt.label}`)
+        return { videoId, raw: parsed }
+      }
+      const errLine = `[${attempt.label}] HTTP ${response.status}: ${text}`
+      allErrors.push(errLine)
+      console.warn(`[Reka] Upload attempt failed: ${errLine}`)
+    }
+    throw new Error(`Reka video upload failed all body shapes:\n${allErrors.join('\n')}`)
+  }
+
+  /**
+   * Q&A on an indexed video. Returns the chat_response string.
+   */
+  async videoQA(videoId: string, prompt: string): Promise<string> {
+    const response = await fetch(`${this.baseUrl}/v1/qa/chat`, {
+      method: 'POST',
+      headers: { 'X-Api-Key': this.apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        video_id: videoId,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    })
+    const text = await response.text()
+    if (!response.ok) {
+      throw new Error(`Reka Q&A error (${response.status}): ${text}`)
+    }
+    let parsed: any = {}
+    try { parsed = JSON.parse(text) } catch { /* */ }
+    return parsed.chat_response || parsed.response || text
+  }
+
+  /**
+   * Get indexing status for an uploaded video. Best-guess endpoint shape;
+   * returns the parsed response so caller can branch on whatever field exists.
+   */
+  async getVideoStatus(videoId: string): Promise<any> {
+    const response = await fetch(`${this.baseUrl}/v1/videos/${videoId}`, {
+      headers: { 'X-Api-Key': this.apiKey },
+    })
+    const text = await response.text()
+    if (!response.ok) {
+      throw new Error(`Reka video status error (${response.status}): ${text}`)
+    }
+    try { return JSON.parse(text) } catch { return { raw: text } }
+  }
 }

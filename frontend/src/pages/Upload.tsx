@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { Upload as UploadIcon, Link as LinkIcon, Loader2, CheckCircle, AlertCircle, X, FileVideo, Info, Sparkles, Scissors as ScissorsIcon } from 'lucide-react'
 import { supabase } from '../lib/supabase'
-import { getVideoMetadata, estimateProcessingTime, formatBytes, formatTime } from '../lib/videoPreprocessing'
+import { getVideoMetadata, estimateProcessingTime, formatBytes, formatTime, isMpegTs, remuxToFaststartMp4 } from '../lib/videoPreprocessing'
 import type { ProcessingMode, AspectRatio } from '../types'
 
 type UploadMethod = 'file' | 'url' | 'batch'
@@ -38,6 +38,8 @@ export function Upload() {
   const [authDebug, setAuthDebug] = useState<string>('')
   const [processingMode, setProcessingMode] = useState<ProcessingMode>('sports_analysis')
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>('9:16')
+  const [remuxing, setRemuxing] = useState(false)
+  const [remuxProgress, setRemuxProgress] = useState(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const batchInputRef = useRef<HTMLInputElement>(null)
 
@@ -133,12 +135,22 @@ export function Upload() {
             prev.map(f => f.id === batchFile.id ? { ...f, status: 'uploading' as const, progress: 0 } : f)
           )
 
+          // Auto-remux MPEG-TS to faststart MP4
+          let batchFileToUpload = batchFile.file
+          if (await isMpegTs(batchFile.file)) {
+            batchFileToUpload = await remuxToFaststartMp4(batchFile.file, (r) =>
+              setBatchFiles(prev =>
+                prev.map(f => f.id === batchFile.id ? { ...f, progress: Math.round(r * 25) } : f)
+              )
+            )
+          }
+
           // Call upload-video Edge Function
           const response = await supabase.functions.invoke('upload-video', {
             body: {
               title: batchFile.title,
               sourceType: 'upload',
-              fileName: batchFile.file.name,
+              fileName: batchFileToUpload.name,
               processingMode,
               aspectRatio: processingMode === 'short_form' ? aspectRatio : '9:16',
             },
@@ -165,8 +177,8 @@ export function Upload() {
 
             const { error: uploadStorageError } = await supabase.storage
               .from('video-uploads')
-              .uploadToSignedUrl(data.uploadPath, token, batchFile.file, {
-                contentType: batchFile.file.type,
+              .uploadToSignedUrl(data.uploadPath, token, batchFileToUpload, {
+                contentType: batchFileToUpload.type,
               })
 
             if (uploadStorageError) {
@@ -236,12 +248,26 @@ export function Upload() {
         throw new Error('No user found. Your session may have expired. Please log in again.')
       }
 
+      // Auto-remux MPEG-TS to faststart MP4 (Reka rejects TS files)
+      let fileToUpload = selectedFile
+      if (await isMpegTs(selectedFile)) {
+        setRemuxing(true)
+        setRemuxProgress(0)
+        try {
+          fileToUpload = await remuxToFaststartMp4(selectedFile, (r) => setRemuxProgress(r))
+        } catch (err: any) {
+          throw new Error(`Remux failed: ${err?.message || err}. Try a different file or remux manually with ffmpeg.`)
+        } finally {
+          setRemuxing(false)
+        }
+      }
+
       // Call upload-video Edge Function (Supabase client auto-adds auth)
       const response = await supabase.functions.invoke('upload-video', {
         body: {
           title,
           sourceType: 'upload',
-          fileName: selectedFile.name,
+          fileName: fileToUpload.name,
           processingMode,
           aspectRatio: processingMode === 'short_form' ? aspectRatio : '9:16',
         },
@@ -280,8 +306,8 @@ export function Upload() {
 
         const { error: uploadStorageError } = await supabase.storage
           .from('video-uploads')
-          .uploadToSignedUrl(data.uploadPath, token, selectedFile, {
-            contentType: selectedFile.type,
+          .uploadToSignedUrl(data.uploadPath, token, fileToUpload, {
+            contentType: fileToUpload.type,
           })
 
         if (uploadStorageError) {
@@ -585,12 +611,37 @@ export function Upload() {
               </div>
             )}
 
+            {/* Remux progress (only shown during MPEG-TS remux) */}
+            {remuxing && (
+              <div className="rounded-lg border bg-card p-4 space-y-2">
+                <div className="flex items-center gap-2 text-sm">
+                  <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+                  <span className="font-medium">Remuxing to MP4...</span>
+                  <span className="text-muted-foreground ml-auto">{Math.round(remuxProgress * 100)}%</span>
+                </div>
+                <div className="w-full bg-muted rounded-full h-2">
+                  <div
+                    className="bg-blue-600 h-2 rounded-full transition-all"
+                    style={{ width: `${Math.round(remuxProgress * 100)}%` }}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Detected MPEG-TS file. Converting to faststart MP4 in your browser (no upload needed yet).
+                </p>
+              </div>
+            )}
+
             <button
               onClick={handleFileUpload}
-              disabled={!selectedFile || !title || status === 'uploading'}
+              disabled={!selectedFile || !title || status === 'uploading' || remuxing}
               className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {status === 'uploading' ? (
+              {remuxing ? (
+                <>
+                  <Loader2 className="inline-block w-4 h-4 mr-2 animate-spin" />
+                  Remuxing...
+                </>
+              ) : status === 'uploading' ? (
                 <>
                   <Loader2 className="inline-block w-4 h-4 mr-2 animate-spin" />
                   Uploading...

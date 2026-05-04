@@ -220,3 +220,55 @@ export function formatTime(seconds: number): string {
   if (mins === 0) return `${secs}s`
   return `${mins}m ${secs}s`
 }
+
+/**
+ * Detect MPEG-TS by sync byte 0x47 at offset 0.
+ * MPEG-TS files often have .mp4 / .ts / .m2ts extensions but Reka rejects them
+ * with "could not convert string to float: 'N/A'" because TS lacks global duration metadata.
+ */
+export async function isMpegTs(file: File): Promise<boolean> {
+  const head = await file.slice(0, 4).arrayBuffer()
+  const bytes = new Uint8Array(head)
+  return bytes[0] === 0x47
+}
+
+/**
+ * Remux a video file to faststart MP4 using ffmpeg-wasm.
+ * Uses stream copy (`-c copy`) — no re-encoding, fast (~10s for 20-min file).
+ * Adds `+faststart` so moov atom is at the head, required by Reka.
+ */
+export async function remuxToFaststartMp4(
+  file: File,
+  onProgress?: (ratio: number) => void
+): Promise<File> {
+  const { FFmpeg } = await import('@ffmpeg/ffmpeg')
+  const { fetchFile } = await import('@ffmpeg/util')
+
+  const ffmpeg = new FFmpeg()
+  if (onProgress) {
+    ffmpeg.on('progress', ({ progress }) => onProgress(progress))
+  }
+
+  // Use absolute origin URLs so Vite's dev middleware serves them as static
+  // assets (not module imports). importScripts() from inside the worker fetches
+  // them like classic scripts, and same-origin satisfies COEP: require-corp.
+  const origin = window.location.origin
+  await ffmpeg.load({
+    coreURL: `${origin}/ffmpeg/ffmpeg-core.js`,
+    wasmURL: `${origin}/ffmpeg/ffmpeg-core.wasm`,
+  })
+
+  const inputName = 'input.bin'
+  const outputName = 'output.mp4'
+  await ffmpeg.writeFile(inputName, await fetchFile(file))
+  await ffmpeg.exec([
+    '-i', inputName,
+    '-c', 'copy',
+    '-movflags', '+faststart',
+    outputName,
+  ])
+  const data = await ffmpeg.readFile(outputName)
+  const blob = new Blob([data as Uint8Array], { type: 'video/mp4' })
+  const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4'
+  return new File([blob], newName, { type: 'video/mp4' })
+}
