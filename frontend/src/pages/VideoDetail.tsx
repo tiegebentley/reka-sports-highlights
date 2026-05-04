@@ -159,9 +159,10 @@ export function VideoDetail() {
           videoId: video.id,
           settings: {
             template: 'moments',
-            num_clips: 3,
-            aspect_ratio: '9:16',
+            num_clips: 10,
+            aspect_ratio: '16:9',
             resolution: 720,
+            prompt: 'Identify every key soccer moment: goals, shots on target, saves by the goalkeeper, cards/bookings (yellow or red), penalties, and major fouls. Generate one clip per distinct event with clear context (build-up + outcome).',
           },
         },
       })

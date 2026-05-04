@@ -154,22 +154,23 @@ export function Upload() {
             throw new Error(data?.error || 'Unknown error from server')
           }
 
-          // Upload file to storage
-          if (data.uploadUrl) {
+          // Upload file to storage via Supabase signed-upload SDK helper
+          if (data.uploadUrl && data.uploadPath) {
             setBatchFiles(prev =>
               prev.map(f => f.id === batchFile.id ? { ...f, progress: 50 } : f)
             )
 
-            const uploadResponse = await fetch(data.uploadUrl, {
-              method: 'PUT',
-              body: batchFile.file,
-              headers: {
-                'Content-Type': batchFile.file.type,
-              },
-            })
+            const token = new URL(data.uploadUrl).searchParams.get('token')
+            if (!token) throw new Error('Signed upload URL missing token')
 
-            if (!uploadResponse.ok) {
-              throw new Error('Failed to upload file to storage')
+            const { error: uploadStorageError } = await supabase.storage
+              .from('video-uploads')
+              .uploadToSignedUrl(data.uploadPath, token, batchFile.file, {
+                contentType: batchFile.file.type,
+              })
+
+            if (uploadStorageError) {
+              throw new Error(`Failed to upload file to storage: ${uploadStorageError.message}`)
             }
           }
 
@@ -272,18 +273,19 @@ export function Upload() {
         throw new Error(data?.error || 'Unknown error from server')
       }
 
-      // Upload file to storage using signed URL
-      if (data.uploadUrl) {
-        const uploadResponse = await fetch(data.uploadUrl, {
-          method: 'PUT',
-          body: selectedFile,
-          headers: {
-            'Content-Type': selectedFile.type,
-          },
-        })
+      // Upload file to storage using Supabase signed-upload SDK helper
+      if (data.uploadUrl && data.uploadPath) {
+        const token = new URL(data.uploadUrl).searchParams.get('token')
+        if (!token) throw new Error('Signed upload URL missing token')
 
-        if (!uploadResponse.ok) {
-          throw new Error('Failed to upload file to storage')
+        const { error: uploadStorageError } = await supabase.storage
+          .from('video-uploads')
+          .uploadToSignedUrl(data.uploadPath, token, selectedFile, {
+            contentType: selectedFile.type,
+          })
+
+        if (uploadStorageError) {
+          throw new Error(`Failed to upload file to storage: ${uploadStorageError.message}`)
         }
       }
 

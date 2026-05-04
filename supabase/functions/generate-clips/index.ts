@@ -63,6 +63,15 @@ serve(async (req) => {
       throw new Error(`Video not found: ${videoError?.message || 'Unknown error'}`)
     }
 
+    // Clear prior clips for this video so regeneration replaces rather than accumulates
+    const { error: deleteClipsError } = await supabase
+      .from('clips')
+      .delete()
+      .eq('video_id', videoId)
+    if (deleteClipsError) {
+      console.warn(`Failed to clear prior clips for video ${videoId}:`, deleteClipsError.message)
+    }
+
     // Create job record
     const { data: job, error: jobError } = await supabase
       .from('jobs')
@@ -89,17 +98,16 @@ serve(async (req) => {
     let videoUrl: string
 
     if (video.source_type === 'upload' && video.storage_path) {
-      // For uploaded files, get public URL from Supabase Storage
-      const { data: publicUrlData } = supabase.storage
+      const { data: signedUrlData, error: signedUrlError } = await supabase.storage
         .from('video-uploads')
-        .getPublicUrl(video.storage_path)
+        .createSignedUrl(video.storage_path, 60 * 60 * 6)
 
-      if (!publicUrlData?.publicUrl) {
-        throw new Error('Failed to generate public URL for uploaded video')
+      if (signedUrlError || !signedUrlData?.signedUrl) {
+        throw new Error(`Failed to generate signed URL for uploaded video: ${signedUrlError?.message ?? 'unknown error'}`)
       }
 
-      videoUrl = publicUrlData.publicUrl
-      console.log(`[Storage] Using public URL: ${videoUrl}`)
+      videoUrl = signedUrlData.signedUrl
+      console.log(`[Storage] Using signed URL (6h TTL)`)
     } else if (video.source_url) {
       // For YouTube/Twitch, use source URL directly
       videoUrl = video.source_url
@@ -119,32 +127,59 @@ serve(async (req) => {
     }
 
     // Generate clips with Reka
+    // NB: Reka expects generation_config / rendering_config as nested objects.
+    // Flat top-level keys (other than video_urls/prompt) are silently ignored.
     const clipRequest: any = {
       video_urls: [videoUrl],
-      template: processingMode === 'sports_analysis' ? (settings?.template || 'moments') : 'moments',
-      num_generations: Math.min(settings?.num_clips || 3, 3), // Max 3
-      aspect_ratio: aspectRatio,
-      resolution: settings?.resolution || 720,
       prompt: settings?.prompt || (processingMode === 'sports_analysis'
         ? 'Detect key moments, player highlights, and important game events'
         : undefined),
+      generation_config: {
+        template: processingMode === 'sports_analysis' ? (settings?.template || 'moments') : 'moments',
+        num_generations: Math.min(settings?.num_clips || 3, 3), // Reka caps at 3 per request
+        max_duration_seconds: settings?.max_duration_seconds || 90,
+      },
+      rendering_config: {
+        aspect_ratio: aspectRatio,
+        resolution: settings?.resolution || 720,
+        subtitles: settings?.subtitles ?? true,
+      },
     }
 
     // For short-form mode with manual segment selection
     if (processingMode === 'short_form' && settings?.segment_start !== undefined && settings?.segment_end !== undefined) {
-      clipRequest.source_start_time = settings.segment_start
-      clipRequest.source_end_time = settings.segment_end
+      clipRequest.generation_config.source_start_time = settings.segment_start
+      clipRequest.generation_config.source_end_time = settings.segment_end
       console.log(`[Short-form] Using segment: ${settings.segment_start}s - ${settings.segment_end}s`)
     }
 
-    console.log(`[Reka] Sending clip generation request (${processingMode} mode):`, clipRequest)
+    console.log(`[Reka] Sending clip generation request (${processingMode} mode):`, JSON.stringify(clipRequest))
 
-    const clipResponse = await rekaClient.generateClips(clipRequest)
+    let clipResponse
+    try {
+      clipResponse = await rekaClient.generateClips(clipRequest)
+    } catch (rekaErr) {
+      const errMsg = rekaErr instanceof Error ? rekaErr.message : String(rekaErr)
+      console.error(`[Reka] generateClips threw: ${errMsg}`)
+      await supabase
+        .from('jobs')
+        .update({
+          status: 'failed',
+          error: `Reka request failed: ${errMsg}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', job.id)
+      await supabase
+        .from('videos')
+        .update({ status: 'uploaded' })
+        .eq('id', videoId)
+      throw rekaErr
+    }
 
-    console.log(`[Reka] Clip generation started: ${clipResponse.id}`)
+    console.log(`[Reka] Clip generation started: ${clipResponse.id} (status=${clipResponse.status})`)
 
-    // Update job with Reka clip ID
-    await supabase
+    // Update job with Reka clip ID — critical for poll-clip-jobs to find this job
+    const { error: updateErr } = await supabase
       .from('jobs')
       .update({
         metadata: {
@@ -152,8 +187,12 @@ serve(async (req) => {
           reka_clip_id: clipResponse.id,
           reka_status: clipResponse.status,
         },
+        updated_at: new Date().toISOString(),
       })
       .eq('id', job.id)
+    if (updateErr) {
+      console.error(`[Job ${job.id}] Failed to persist reka_clip_id ${clipResponse.id}:`, updateErr.message)
+    }
 
     // Note: Polling is handled by a separate worker/scheduled function
     // to avoid blocking this request. The client should poll the job status.

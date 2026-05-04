@@ -88,14 +88,15 @@ serve(async (req) => {
       throw new Error('fileName is required for direct uploads')
     }
 
-    let storagePath = null
-    let videoUrl = sourceUrl
+    let storagePath: string | null = null
+    let videoUrl: string | null = sourceUrl ?? null
 
     // For direct uploads, generate signed upload URL
     if (sourceType === 'upload' && fileName) {
       const timestamp = Date.now()
       const fileExtension = fileName.split('.').pop()
-      storagePath = `${user.id}/${timestamp}_${fileName}`
+      const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_')
+      storagePath = `${user.id}/${timestamp}_${safeName}`
 
       // Create a signed upload URL (valid for 60 minutes)
       // Use admin client to bypass RLS on storage operations
@@ -110,12 +111,8 @@ serve(async (req) => {
         throw new Error(`Failed to create upload URL: ${uploadError.message}`)
       }
 
-      // Get the public URL for the uploaded file (after upload completes)
-      const { data: publicUrlData } = supabaseAdmin.storage
-        .from('video-uploads')
-        .getPublicUrl(storagePath)
-
-      videoUrl = publicUrlData.publicUrl
+      // Uploaded files use storage_path; signed URLs are generated on demand by consumers.
+      videoUrl = null
     }
 
     // Create video record in database

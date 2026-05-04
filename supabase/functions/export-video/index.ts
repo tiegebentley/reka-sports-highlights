@@ -269,18 +269,20 @@ async function processExport(
 
     if (uploadError) throw uploadError;
 
-    // Get public URL
-    const { data: urlData } = supabase.storage
+    const { data: signedUrlData, error: signedUrlError } = await supabase.storage
       .from('videos')
-      .getPublicUrl(outputFileName);
+      .createSignedUrl(outputFileName, 60 * 60 * 24 * 7);
 
-    // Update job as completed
+    if (signedUrlError || !signedUrlData?.signedUrl) {
+      throw new Error(`Failed to sign exported video URL: ${signedUrlError?.message ?? 'unknown error'}`);
+    }
+
     await supabase
       .from('export_jobs')
       .update({
         status: 'completed',
         progress: 100,
-        output_url: urlData.publicUrl,
+        output_url: signedUrlData.signedUrl,
         updated_at: new Date().toISOString(),
       })
       .eq('id', jobId);

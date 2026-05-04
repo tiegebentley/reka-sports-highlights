@@ -42,7 +42,28 @@ serve(async (req) => {
         const rekaClipId = job.metadata?.reka_clip_id
 
         if (!rekaClipId) {
-          console.warn(`Job ${job.id} has no reka_clip_id`)
+          // Zombie job — generate-clips inserted the row but never persisted
+          // a reka_clip_id (timeout, crash, or Reka call failure). After 3 min
+          // mark it failed so the UI can recover.
+          const ageMs = Date.now() - new Date(job.created_at).getTime()
+          if (ageMs > 3 * 60 * 1000) {
+            console.warn(`Job ${job.id} stuck without reka_clip_id for ${Math.round(ageMs / 1000)}s — marking failed`)
+            await supabase
+              .from('jobs')
+              .update({
+                status: 'failed',
+                error: 'Clip generation never registered with Reka (likely edge function timeout). Please retry.',
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', job.id)
+            await supabase
+              .from('videos')
+              .update({ status: 'uploaded' })
+              .eq('id', job.video_id)
+            results.push({ jobId: job.id, status: 'failed', error: 'zombie' })
+          } else {
+            console.warn(`Job ${job.id} has no reka_clip_id yet (age ${Math.round(ageMs / 1000)}s) — waiting`)
+          }
           continue
         }
 
@@ -106,7 +127,12 @@ serve(async (req) => {
             .from('jobs')
             .update({
               status: 'failed',
-              error: clipStatus.error || 'Reka clip generation failed',
+              error: clipStatus.error || `Reka clip generation failed (no error field). Full payload: ${JSON.stringify(clipStatus)}`,
+              metadata: {
+                ...job.metadata,
+                reka_status: 'failed',
+                reka_failure: clipStatus,
+              },
               updated_at: new Date().toISOString(),
             })
             .eq('id', job.id)

@@ -110,6 +110,12 @@ export function Library() {
     try {
       setDeletingVideo(videoId)
 
+      const { data: videoRow } = await supabase
+        .from('videos')
+        .select('storage_path')
+        .eq('id', videoId)
+        .maybeSingle()
+
       const { error: deleteError } = await supabase
         .from('videos')
         .delete()
@@ -117,6 +123,15 @@ export function Library() {
 
       if (deleteError) {
         throw deleteError
+      }
+
+      if (videoRow?.storage_path) {
+        const { error: storageError } = await supabase.storage
+          .from('video-uploads')
+          .remove([videoRow.storage_path])
+        if (storageError) {
+          console.warn('Storage cleanup failed (DB row already deleted):', storageError)
+        }
       }
 
       // Remove from local state
@@ -431,9 +446,10 @@ export function Library() {
           videoId,
           settings: {
             template: 'moments',
-            num_clips: 3,
-            aspect_ratio: '9:16',
+            num_clips: 10,
+            aspect_ratio: '16:9',
             resolution: 720,
+            prompt: 'Identify every key soccer moment: goals, shots on target, saves by the goalkeeper, cards/bookings (yellow or red), penalties, and major fouls. Generate one clip per distinct event with clear context (build-up + outcome).',
           },
         },
       })
@@ -770,9 +786,28 @@ export function Library() {
                 )}
 
                 {video.status === 'completed' && (
-                  <div className="w-full rounded-md bg-green-100 text-green-800 px-3 py-2 text-sm font-medium flex items-center justify-center gap-2">
-                    <CheckCircle2 className="w-4 h-4" />
-                    Clips Ready
+                  <div className="space-y-2">
+                    <div className="w-full rounded-md bg-green-100 text-green-800 px-3 py-2 text-sm font-medium flex items-center justify-center gap-2">
+                      <CheckCircle2 className="w-4 h-4" />
+                      Clips Ready
+                    </div>
+                    <button
+                      onClick={(e) => handleGenerateClips(video.id, e)}
+                      disabled={isGenerating}
+                      className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                    >
+                      {isGenerating ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Regenerating...
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="w-4 h-4" />
+                          Regenerate Clips
+                        </>
+                      )}
+                    </button>
                   </div>
                 )}
               </div>

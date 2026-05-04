@@ -111,18 +111,25 @@ Deno.serve(async (req) => {
       );
     }
 
-    // Get public URL
-    const { data: urlData } = supabase.storage
+    const { data: signedUrlData, error: signedUrlError } = await supabase.storage
       .from('audio')
-      .getPublicUrl(filename);
+      .createSignedUrl(filename, 60 * 60 * 24 * 7);
 
-    // Save commentary track to database
+    if (signedUrlError || !signedUrlData?.signedUrl) {
+      return new Response(
+        JSON.stringify({ error: 'Failed to sign audio URL', details: signedUrlError?.message }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const audioUrl = signedUrlData.signedUrl;
+
     const { data: commentaryData, error: dbError } = await supabase
       .from('commentary_tracks')
       .insert({
         clip_id: clipId,
         text,
-        audio_url: urlData.publicUrl,
+        audio_url: audioUrl,
         voice_id: selectedVoiceId,
         voice_settings: voiceSettings || defaultVoiceSettings,
       })
@@ -141,7 +148,7 @@ Deno.serve(async (req) => {
       JSON.stringify({
         success: true,
         commentary: commentaryData,
-        audioUrl: urlData.publicUrl,
+        audioUrl,
       }),
       {
         status: 200,
