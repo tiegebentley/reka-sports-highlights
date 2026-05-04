@@ -153,6 +153,112 @@ serve(async (req) => {
       console.log(`[Short-form] Using segment: ${settings.segment_start}s - ${settings.segment_end}s`)
     }
 
+    // Multi-segment clipping: split long sports_analysis videos into ~4-min windows
+    // so Reka's 3-clip-per-call cap doesn't lose highlights from later in the match.
+    // Skipped when caller already specified an explicit segment_start/end (short-form).
+    const SEGMENT_TARGET_SECONDS = 240
+    const explicitSegment = settings?.segment_start !== undefined && settings?.segment_end !== undefined
+    const duration = video.duration_seconds || 0
+    const useMultiSegment =
+      processingMode === 'sports_analysis' &&
+      !explicitSegment &&
+      duration > SEGMENT_TARGET_SECONDS
+
+    type Segment = { start: number; end: number }
+    const segments: Segment[] = []
+    if (useMultiSegment) {
+      const n = Math.ceil(duration / SEGMENT_TARGET_SECONDS)
+      const windowSize = duration / n
+      for (let i = 0; i < n; i++) {
+        segments.push({
+          start: Math.floor(i * windowSize),
+          end: i === n - 1 ? Math.floor(duration) : Math.floor((i + 1) * windowSize),
+        })
+      }
+      console.log(`[Multi-segment] duration=${duration}s → ${n} windows:`, segments)
+    }
+
+    if (useMultiSegment) {
+      const baseRequest = clipRequest
+      const calls = segments.map(async (seg) => {
+        const segRequest = {
+          ...baseRequest,
+          generation_config: {
+            ...baseRequest.generation_config,
+            source_start_time: seg.start,
+            source_end_time: seg.end,
+          },
+        }
+        try {
+          const resp = await rekaClient.generateClips(segRequest)
+          console.log(`[Reka] Segment ${seg.start}-${seg.end}s started: ${resp.id} (status=${resp.status})`)
+          return { ok: true as const, segment: seg, id: resp.id, status: resp.status }
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e)
+          console.error(`[Reka] Segment ${seg.start}-${seg.end}s failed:`, errMsg)
+          return { ok: false as const, segment: seg, error: errMsg }
+        }
+      })
+      const settled = await Promise.all(calls)
+      const successes = settled.filter((r) => r.ok)
+      const failures = settled.filter((r) => !r.ok)
+
+      if (successes.length === 0) {
+        const errSummary = failures.map((f) => `${f.segment.start}-${f.segment.end}s: ${f.error}`).join('; ')
+        await supabase
+          .from('jobs')
+          .update({
+            status: 'failed',
+            error: `All ${segments.length} Reka segment calls failed: ${errSummary}`,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', job.id)
+        await supabase.from('videos').update({ status: 'uploaded' }).eq('id', videoId)
+        throw new Error(`All segments failed: ${errSummary}`)
+      }
+
+      const rekaClipIds = successes.map((s) => ({
+        id: s.id,
+        start: s.segment.start,
+        end: s.segment.end,
+        status: s.status,
+      }))
+
+      const { error: updateErr } = await supabase
+        .from('jobs')
+        .update({
+          metadata: {
+            ...job.metadata,
+            reka_clip_ids: rekaClipIds,
+            reka_status: 'processing',
+            multi_segment: true,
+            segment_failures: failures.length > 0 ? failures.map((f) => ({ segment: f.segment, error: f.error })) : undefined,
+          },
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', job.id)
+      if (updateErr) {
+        console.error(`[Job ${job.id}] Failed to persist reka_clip_ids:`, updateErr.message)
+      }
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          jobId: job.id,
+          multiSegment: true,
+          segments: rekaClipIds,
+          failedSegments: failures.length,
+          message: `Clip generation started across ${successes.length}/${segments.length} segments.`,
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        }
+      )
+    }
+
     console.log(`[Reka] Sending clip generation request (${processingMode} mode):`, JSON.stringify(clipRequest))
 
     let clipResponse
