@@ -791,22 +791,15 @@ export function Library() {
                       <CheckCircle2 className="w-4 h-4" />
                       Clips Ready
                     </div>
+                    {/* Routes to the video page where the verify-then-generate flow lives.
+                        Direct regeneration here would bypass match context + event verification
+                        and undo our quality work. */}
                     <button
-                      onClick={(e) => handleGenerateClips(video.id, e)}
-                      disabled={isGenerating}
-                      className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                      onClick={(e) => { e.stopPropagation(); navigate(`/videos/${video.id}`) }}
+                      className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground transition-colors flex items-center justify-center gap-2"
                     >
-                      {isGenerating ? (
-                        <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          Regenerating...
-                        </>
-                      ) : (
-                        <>
-                          <RefreshCw className="w-4 h-4" />
-                          Regenerate Clips
-                        </>
-                      )}
+                      <PlayCircle className="w-4 h-4" />
+                      Open & Manage
                     </button>
                   </div>
                 )}

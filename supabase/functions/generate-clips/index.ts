@@ -21,6 +21,11 @@ interface GenerateClipsRequest {
     segment_end?: number
     max_duration_seconds?: number
     subtitles?: boolean
+    // Pre-computed events from a prior analyze-events call. When provided we
+    // skip the analyze step entirely and clip directly from these events. This
+    // is the "verify then generate" path — user previews events, optionally
+    // edits them, then triggers clip generation without re-paying for Q&A.
+    events?: DetectedEvent[]
   }
 }
 
@@ -175,50 +180,74 @@ serve(async (req) => {
       const preRoll = settings?.pre_roll_seconds ?? 7
       const postRoll = settings?.post_roll_seconds ?? 7
 
-      console.log(`[per-event] Invoking analyze-events for video ${videoId}`)
-      const analyzeResp = await fetch(`${supabaseUrl}/functions/v1/analyze-events`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${supabaseServiceKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ videoId }),
-      })
+      // PATH A: caller supplied a pre-computed event list (from a prior
+      // List Events run). Skip the analyze call entirely.
+      // PATH B: no events provided — invoke analyze-events as before.
+      let allEvents: DetectedEvent[]
+      const suppliedEvents = settings?.events
+      if (Array.isArray(suppliedEvents) && suppliedEvents.length > 0) {
+        // Defensive validation: keep only entries with the required shape.
+        allEvents = suppliedEvents
+          .filter((e: any) =>
+            e &&
+            typeof e.type === 'string' &&
+            typeof e.start === 'number' &&
+            typeof e.end === 'number'
+          )
+          .map((e: any) => ({
+            type: String(e.type),
+            start: Number(e.start),
+            end: Number(e.end),
+            description: typeof e.description === 'string' ? e.description : '',
+            confidence: typeof e.confidence === 'number' ? e.confidence : 0.8,
+          }))
+        console.log(`[per-event] Using ${allEvents.length} pre-supplied events; skipping analyze-events call`)
+      } else {
+        console.log(`[per-event] Invoking analyze-events for video ${videoId}`)
+        const analyzeResp = await fetch(`${supabaseUrl}/functions/v1/analyze-events`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${supabaseServiceKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ videoId }),
+        })
 
-      if (!analyzeResp.ok) {
-        const errBody = await analyzeResp.text()
-        await supabase
-          .from('jobs')
-          .update({
-            status: 'failed',
-            error: `analyze-events failed (${analyzeResp.status}): ${errBody.slice(0, 500)}`,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', job.id)
-        await supabase.from('videos').update({ status: 'uploaded' }).eq('id', videoId)
-        throw new Error(`analyze-events failed: ${errBody.slice(0, 200)}`)
+        if (!analyzeResp.ok) {
+          const errBody = await analyzeResp.text()
+          await supabase
+            .from('jobs')
+            .update({
+              status: 'failed',
+              error: `analyze-events failed (${analyzeResp.status}): ${errBody.slice(0, 500)}`,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', job.id)
+          await supabase.from('videos').update({ status: 'uploaded' }).eq('id', videoId)
+          throw new Error(`analyze-events failed: ${errBody.slice(0, 200)}`)
+        }
+
+        const analyzeJson = await analyzeResp.json() as {
+          ok: boolean
+          events?: DetectedEvent[]
+          error?: string
+        }
+
+        if (!analyzeJson.ok || !Array.isArray(analyzeJson.events)) {
+          await supabase
+            .from('jobs')
+            .update({
+              status: 'failed',
+              error: `analyze-events returned no events: ${analyzeJson.error || 'unknown'}`,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', job.id)
+          await supabase.from('videos').update({ status: 'uploaded' }).eq('id', videoId)
+          throw new Error(`analyze-events returned no events`)
+        }
+
+        allEvents = analyzeJson.events
       }
-
-      const analyzeJson = await analyzeResp.json() as {
-        ok: boolean
-        events?: DetectedEvent[]
-        error?: string
-      }
-
-      if (!analyzeJson.ok || !Array.isArray(analyzeJson.events)) {
-        await supabase
-          .from('jobs')
-          .update({
-            status: 'failed',
-            error: `analyze-events returned no events: ${analyzeJson.error || 'unknown'}`,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', job.id)
-        await supabase.from('videos').update({ status: 'uploaded' }).eq('id', videoId)
-        throw new Error(`analyze-events returned no events`)
-      }
-
-      const allEvents = analyzeJson.events
       const events = allEvents
         .filter((e) => e.confidence >= minConf)
         .filter((e) => e.end > e.start)

@@ -400,6 +400,40 @@ export function VideoDetail() {
     }
   }
 
+  // Generate clips directly from a previewed event list. Skips the
+  // analyze-events call inside generate-clips by passing settings.events.
+  // Cheaper (no extra Q&A round-trip) and lets the user verify before paying
+  // Reka clip credits.
+  const handleGenerateFromEvents = async () => {
+    if (!video || !analyzeEventsResult || analyzeEventsResult.events.length === 0) return
+    try {
+      setGeneratingClips(true)
+      const { data, error: generateError } = await supabase.functions.invoke('generate-clips', {
+        body: {
+          videoId: video.id,
+          settings: {
+            mode: 'per_event',
+            aspect_ratio: '16:9',
+            resolution: 720,
+            // Drop confidence filter to 0 — the user already vetted these
+            // events by clicking the button, so let them all through.
+            min_event_confidence: 0,
+            events: analyzeEventsResult.events,
+          },
+        },
+      })
+      if (generateError) throw generateError
+      if (data?.error) throw new Error(data.error)
+      // Refetch so the jobs list updates and "Processing..." status appears.
+      await fetchVideoDetails()
+    } catch (err: any) {
+      console.error('Generate-from-events failed:', err)
+      alert(`Failed to start generation: ${err.message || err}`)
+    } finally {
+      setGeneratingClips(false)
+    }
+  }
+
   const handleGenerateClips = async () => {
     if (!video) return
 
@@ -841,11 +875,17 @@ export function VideoDetail() {
               </div>
 
               <div className="flex gap-3 mt-6">
-                {canGenerateClips && (
+                {/* Standalone Generate Clips: shown when the user hasn't run List Events yet
+                    (or has no analyzed events to clip from). Once events are listed, the
+                    "Generate N clips from these events" button on the events panel becomes the
+                    primary action — we hide this fallback to push users toward the verify-first flow.
+                    Kept available as a quick-path for users who don't want to verify. */}
+                {canGenerateClips && !analyzeEventsResult && (
                   <button
                     onClick={handleGenerateClips}
                     disabled={generatingClips || hasActiveJobs}
-                    className="flex-1 rounded-md bg-primary px-4 py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                    className="flex-1 rounded-md border border-input bg-background px-4 py-3 text-sm font-medium hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                    title="Quick path: skip event preview and generate immediately. List Events first for better quality."
                   >
                     {generatingClips ? (
                       <>
@@ -860,7 +900,7 @@ export function VideoDetail() {
                     ) : (
                       <>
                         <Scissors className="w-4 h-4" />
-                        Generate Clips
+                        Quick Generate
                       </>
                     )}
                   </button>
@@ -868,8 +908,8 @@ export function VideoDetail() {
                 <button
                   onClick={handleAnalyzeEvents}
                   disabled={analyzingEvents}
-                  className="flex-1 rounded-md border border-input bg-background px-4 py-3 text-sm font-medium hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                  title="Beta: ask Reka Q&A to list every event with timestamps. No clipping yet — verifies if Reka returns usable data."
+                  className="flex-1 rounded-md bg-primary px-4 py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  title="Recommended flow: list detected events first, then generate one clip per verified event."
                 >
                   {analyzingEvents ? (
                     <>
@@ -879,7 +919,7 @@ export function VideoDetail() {
                   ) : (
                     <>
                       <PlayCircle className="w-4 h-4" />
-                      List Events (Beta)
+                      {analyzeEventsResult ? 'Re-list Events' : 'List Events'}
                     </>
                   )}
                 </button>
@@ -966,6 +1006,35 @@ export function VideoDetail() {
                         })}
                       </tbody>
                     </table>
+                  </div>
+                  {/* Primary action: generate clips from this exact event list. Skips the
+                      analyze-events call inside generate-clips so we don't pay for Q&A twice. */}
+                  <div className="flex items-center justify-between gap-3 pt-3 mt-3 border-t">
+                    <p className="text-xs text-muted-foreground flex-1">
+                      Review the events above. When ready, generate one clip per event using the verified list.
+                    </p>
+                    <button
+                      onClick={handleGenerateFromEvents}
+                      disabled={generatingClips || hasActiveJobs}
+                      className="rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 whitespace-nowrap"
+                    >
+                      {generatingClips ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Starting...
+                        </>
+                      ) : hasActiveJobs ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Processing...
+                        </>
+                      ) : (
+                        <>
+                          <Scissors className="w-4 h-4" />
+                          Generate {analyzeEventsResult.events.length} clip{analyzeEventsResult.events.length === 1 ? '' : 's'} from these events
+                        </>
+                      )}
+                    </button>
                   </div>
                   <details className="mt-4">
                     <summary className="text-xs text-muted-foreground cursor-pointer hover:text-foreground">
