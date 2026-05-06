@@ -205,6 +205,10 @@ export function VideoDetail() {
   // Bulk-delete state. Selecting clips reveals an action bar; delete with confirm.
   const [selectedClips, setSelectedClips] = useState<Set<string>>(new Set())
   const [bulkDeleting, setBulkDeleting] = useState(false)
+  // Compile-reel state. Tracks ffmpeg progress + status messages while stitching.
+  const [compiling, setCompiling] = useState(false)
+  const [compileStatus, setCompileStatus] = useState<string>('')
+  const [compileProgress, setCompileProgress] = useState<number>(0)
 
   const toggleClipSelected = (clipId: string) => {
     setSelectedClips(prev => {
@@ -295,6 +299,69 @@ export function VideoDetail() {
       setContextOpen(false)
     }
     setSavingContext(false)
+  }
+
+  // Auto-select the top-N clips by score (then event_confidence). Used by
+  // the "Top 5 / Top 10" quick buttons on the compile action bar.
+  const selectTopByScore = (n: number) => {
+    const ranked = [...clips]
+      .filter(c => c.clip_url)  // only clips with a playable URL can be compiled
+      .sort((a, b) => {
+        const sa = a.quality_score ?? -1
+        const sb = b.quality_score ?? -1
+        if (sb !== sa) return sb - sa
+        const ca = a.event_confidence ?? -1
+        const cb = b.event_confidence ?? -1
+        return cb - ca
+      })
+      .slice(0, n)
+    setSelectedClips(new Set(ranked.map(c => c.id)))
+  }
+
+  // Compile selected clips into a single MP4 reel using ffmpeg.wasm.
+  // Uses the source video's chronological order (segment_start asc) so the
+  // reel watches like a coherent timeline rather than jumping around.
+  // Triggers a download when complete.
+  const compileSelectedReel = async () => {
+    if (selectedClips.size === 0 || compiling) return
+    const ordered = clips
+      .filter(c => selectedClips.has(c.id) && c.clip_url)
+      .sort((a, b) => (a.segment_start ?? 0) - (b.segment_start ?? 0))
+    if (ordered.length === 0) {
+      alert('Selected clips have no playable URLs yet.')
+      return
+    }
+    const urls = ordered.map(c => c.clip_url!).filter(Boolean)
+    try {
+      setCompiling(true)
+      setCompileProgress(0)
+      setCompileStatus('Loading FFmpeg…')
+      const { compileReelFromUrls } = await import('../lib/videoPreprocessing')
+      const blob = await compileReelFromUrls(
+        urls,
+        (msg) => setCompileStatus(msg),
+        (ratio) => setCompileProgress(Math.max(0, Math.min(1, ratio))),
+      )
+      // Trigger a download.
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const safeTitle = (video?.title ?? 'reel').replace(/[^a-z0-9]+/gi, '_').slice(0, 60)
+      a.download = `${safeTitle}_best_of_${ordered.length}.mp4`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      // Revoke after a tick so Safari finishes the download stream.
+      setTimeout(() => URL.revokeObjectURL(url), 5_000)
+      setCompileStatus(`Reel ready: ${ordered.length} clips compiled.`)
+    } catch (err: any) {
+      console.error('Compile reel failed:', err)
+      alert(`Compile failed: ${err.message || err}`)
+      setCompileStatus('')
+    } finally {
+      setCompiling(false)
+      setCompileProgress(0)
+    }
   }
 
   const deleteSelectedClips = async () => {
@@ -1465,10 +1532,9 @@ export function VideoDetail() {
                   </p>
                 )}
 
-                {/* Bulk-select action bar — only shown when clips are selected, OR
-                    a "Select all visible" trigger is always available. */}
+                {/* Bulk-select action bar — selection + delete + compile reel actions. */}
                 {filteredClips.length > 0 && (
-                  <div className="flex items-center gap-2 mb-3 text-xs">
+                  <div className="flex flex-wrap items-center gap-2 mb-3 text-xs">
                     {selectedClips.size > 0 ? (
                       <>
                         <span className="font-medium">{selectedClips.size} selected</span>
@@ -1484,18 +1550,6 @@ export function VideoDetail() {
                         >
                           Clear
                         </button>
-                        <button
-                          onClick={deleteSelectedClips}
-                          disabled={bulkDeleting}
-                          className="ml-auto rounded-md bg-destructive px-3 py-1.5 font-medium text-destructive-foreground hover:bg-destructive/90 transition-colors disabled:opacity-50 flex items-center gap-1"
-                        >
-                          {bulkDeleting ? (
-                            <Loader2 className="w-3 h-3 animate-spin" />
-                          ) : (
-                            <Trash2 className="w-3 h-3" />
-                          )}
-                          Delete {selectedClips.size} clip{selectedClips.size === 1 ? '' : 's'}
-                        </button>
                       </>
                     ) : (
                       <button
@@ -1504,6 +1558,67 @@ export function VideoDetail() {
                       >
                         Select all visible ({filteredClips.length})
                       </button>
+                    )}
+
+                    {/* Quick "best of" pickers — auto-select top-N then user clicks compile. */}
+                    <span className="text-muted-foreground ml-1">Best of:</span>
+                    <button
+                      onClick={() => selectTopByScore(5)}
+                      disabled={compiling}
+                      className="text-muted-foreground hover:text-foreground underline disabled:opacity-50"
+                    >
+                      Top 5
+                    </button>
+                    <button
+                      onClick={() => selectTopByScore(10)}
+                      disabled={compiling}
+                      className="text-muted-foreground hover:text-foreground underline disabled:opacity-50"
+                    >
+                      Top 10
+                    </button>
+
+                    <div className="ml-auto flex items-center gap-2">
+                      <button
+                        onClick={compileSelectedReel}
+                        disabled={compiling || selectedClips.size === 0}
+                        title={selectedClips.size === 0 ? 'Select clips first' : `Stitch ${selectedClips.size} clips into one MP4 reel (downloads when complete)`}
+                        className="rounded-md bg-primary px-3 py-1.5 font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center gap-1"
+                      >
+                        {compiling ? <Loader2 className="w-3 h-3 animate-spin" /> : <Scissors className="w-3 h-3" />}
+                        Compile reel ({selectedClips.size})
+                      </button>
+                      {selectedClips.size > 0 && (
+                        <button
+                          onClick={deleteSelectedClips}
+                          disabled={bulkDeleting || compiling}
+                          className="rounded-md bg-destructive px-3 py-1.5 font-medium text-destructive-foreground hover:bg-destructive/90 transition-colors disabled:opacity-50 flex items-center gap-1"
+                        >
+                          {bulkDeleting ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <Trash2 className="w-3 h-3" />
+                          )}
+                          Delete {selectedClips.size}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Compile progress strip — visible while ffmpeg is downloading + stitching. */}
+                {(compiling || compileStatus) && (
+                  <div className="mb-3 rounded-md border bg-muted/40 p-3">
+                    <div className="flex items-center gap-2 text-xs">
+                      {compiling && <Loader2 className="w-3 h-3 animate-spin" />}
+                      <span className="text-muted-foreground">{compileStatus || 'Working…'}</span>
+                    </div>
+                    {compiling && (
+                      <div className="mt-2 w-full bg-muted rounded-full h-1.5 overflow-hidden">
+                        <div
+                          className="bg-primary h-1.5 rounded-full transition-all"
+                          style={{ width: `${Math.round(compileProgress * 100)}%` }}
+                        />
+                      </div>
                     )}
                   </div>
                 )}

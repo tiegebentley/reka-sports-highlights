@@ -272,3 +272,95 @@ export async function remuxToFaststartMp4(
   const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4'
   return new File([blob], newName, { type: 'video/mp4' })
 }
+
+/**
+ * Concatenate a sequence of clip URLs into a single MP4 reel using the
+ * ffmpeg concat demuxer. Tries stream-copy first (fast, no re-encode); on
+ * failure (e.g. mismatched codecs/parameters) falls back to re-encoding to
+ * H.264/AAC so the output always plays.
+ *
+ * Clips are downloaded sequentially. Total time roughly:
+ *   downloads + (~2s per clip for stream-copy) + (~5-10s/clip for re-encode).
+ *
+ * Returns a Blob the caller can pipe into a download link or upload.
+ */
+export async function compileReelFromUrls(
+  clipUrls: string[],
+  onStatus?: (msg: string) => void,
+  onProgress?: (ratio: number) => void
+): Promise<Blob> {
+  if (clipUrls.length === 0) throw new Error('No clips to compile')
+  if (clipUrls.length === 1) {
+    // Trivial case — just fetch the one clip and return it.
+    onStatus?.('Fetching single clip…')
+    const r = await fetch(clipUrls[0])
+    if (!r.ok) throw new Error(`Failed to fetch clip: ${r.status}`)
+    return await r.blob()
+  }
+
+  const { FFmpeg } = await import('@ffmpeg/ffmpeg')
+  const { fetchFile } = await import('@ffmpeg/util')
+
+  const ffmpeg = new FFmpeg()
+  if (onProgress) {
+    ffmpeg.on('progress', ({ progress }) => onProgress(progress))
+  }
+
+  const origin = window.location.origin
+  await ffmpeg.load({
+    coreURL: `${origin}/ffmpeg/ffmpeg-core.js`,
+    wasmURL: `${origin}/ffmpeg/ffmpeg-core.wasm`,
+  })
+
+  // Download each clip and write into the FFmpeg virtual FS.
+  const inputNames: string[] = []
+  for (let i = 0; i < clipUrls.length; i++) {
+    onStatus?.(`Downloading clip ${i + 1} of ${clipUrls.length}…`)
+    const name = `in${i.toString().padStart(3, '0')}.mp4`
+    await ffmpeg.writeFile(name, await fetchFile(clipUrls[i]))
+    inputNames.push(name)
+  }
+
+  // Build the concat demuxer manifest. Each line: file '<filename>'.
+  const manifest = inputNames.map(n => `file '${n}'`).join('\n')
+  await ffmpeg.writeFile('concat.txt', new TextEncoder().encode(manifest))
+
+  const outputName = 'reel.mp4'
+
+  // Path A: stream copy. Works when all clips share codec + parameters.
+  onStatus?.('Stitching clips (fast path)…')
+  let succeeded = false
+  try {
+    await ffmpeg.exec([
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', 'concat.txt',
+      '-c', 'copy',
+      '-movflags', '+faststart',
+      outputName,
+    ])
+    succeeded = true
+  } catch (e) {
+    console.warn('Stream-copy concat failed, falling back to re-encode:', e)
+  }
+
+  // Path B: re-encode. Slower but reliable across mismatched inputs.
+  if (!succeeded) {
+    onStatus?.('Stitching clips (re-encoding for compatibility)…')
+    await ffmpeg.exec([
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', 'concat.txt',
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-movflags', '+faststart',
+      outputName,
+    ])
+  }
+
+  const data = await ffmpeg.readFile(outputName)
+  return new Blob([data as BlobPart], { type: 'video/mp4' })
+}
