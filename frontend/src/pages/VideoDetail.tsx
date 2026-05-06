@@ -18,6 +18,7 @@ import {
   Check,
   X,
   Plus,
+  Trash2,
 } from 'lucide-react'
 
 // Soccer event taxonomy. Each tag has a label + Tailwind colour token used
@@ -165,6 +166,21 @@ export function VideoDetail() {
     setEditingTagsDraft(new Set())
   }
 
+  // Bulk-delete state. Selecting clips reveals an action bar; delete with confirm.
+  const [selectedClips, setSelectedClips] = useState<Set<string>>(new Set())
+  const [bulkDeleting, setBulkDeleting] = useState(false)
+
+  const toggleClipSelected = (clipId: string) => {
+    setSelectedClips(prev => {
+      const next = new Set(prev)
+      if (next.has(clipId)) next.delete(clipId)
+      else next.add(clipId)
+      return next
+    })
+  }
+
+  const clearSelection = () => setSelectedClips(new Set())
+
   // Inline single-tag mutation. Optimistic update with rollback on DB error.
   // Used for one-click verification — click ×  to remove, click + popover to add.
   const [tagAddOpenFor, setTagAddOpenFor] = useState<string | null>(null)
@@ -209,6 +225,24 @@ export function VideoDetail() {
     const nextTags = SOCCER_TAGS.filter(t => nextSet.has(t.id)).map(t => t.id)
     mutateClipTags(clipId, nextTags)
     setTagAddOpenFor(null)
+  }
+
+  const deleteSelectedClips = async () => {
+    if (selectedClips.size === 0 || bulkDeleting) return
+    const ids = Array.from(selectedClips)
+    if (!confirm(`Delete ${ids.length} clip${ids.length === 1 ? '' : 's'}? This cannot be undone.`)) return
+    setBulkDeleting(true)
+    const prevSnapshot = clips
+    // Optimistic remove
+    setClips(prev => prev.filter(c => !selectedClips.has(c.id)))
+    setSelectedClips(new Set())
+    const { error: delErr } = await supabase.from('clips').delete().in('id', ids)
+    if (delErr) {
+      console.error('Failed to delete clips:', delErr.message)
+      setClips(prevSnapshot)
+      alert(`Delete failed: ${delErr.message}`)
+    }
+    setBulkDeleting(false)
   }
 
   // Apply filter: clip passes if it carries every active filter tag (AND match).
@@ -822,9 +856,69 @@ export function VideoDetail() {
                   </p>
                 )}
 
+                {/* Bulk-select action bar — only shown when clips are selected, OR
+                    a "Select all visible" trigger is always available. */}
+                {filteredClips.length > 0 && (
+                  <div className="flex items-center gap-2 mb-3 text-xs">
+                    {selectedClips.size > 0 ? (
+                      <>
+                        <span className="font-medium">{selectedClips.size} selected</span>
+                        <button
+                          onClick={() => setSelectedClips(new Set(filteredClips.map(c => c.id)))}
+                          className="text-muted-foreground hover:text-foreground underline"
+                        >
+                          Select all visible ({filteredClips.length})
+                        </button>
+                        <button
+                          onClick={clearSelection}
+                          className="text-muted-foreground hover:text-foreground underline"
+                        >
+                          Clear
+                        </button>
+                        <button
+                          onClick={deleteSelectedClips}
+                          disabled={bulkDeleting}
+                          className="ml-auto rounded-md bg-destructive px-3 py-1.5 font-medium text-destructive-foreground hover:bg-destructive/90 transition-colors disabled:opacity-50 flex items-center gap-1"
+                        >
+                          {bulkDeleting ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <Trash2 className="w-3 h-3" />
+                          )}
+                          Delete {selectedClips.size} clip{selectedClips.size === 1 ? '' : 's'}
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={() => setSelectedClips(new Set(filteredClips.map(c => c.id)))}
+                        className="text-muted-foreground hover:text-foreground underline"
+                      >
+                        Select all visible ({filteredClips.length})
+                      </button>
+                    )}
+                  </div>
+                )}
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {filteredClips.map((clip) => (
-                  <div key={clip.id} className="rounded-lg border bg-muted/50 overflow-hidden">
+                  <div
+                    key={clip.id}
+                    className={`rounded-lg border bg-muted/50 overflow-hidden relative ${
+                      selectedClips.has(clip.id) ? 'ring-2 ring-primary border-primary' : ''
+                    }`}
+                  >
+                    {/* Selection checkbox — overlaid on the video area, top-left. */}
+                    <label
+                      className="absolute top-2 left-2 z-10 cursor-pointer flex items-center justify-center w-6 h-6 rounded bg-black/50 backdrop-blur-sm hover:bg-black/70 transition-colors"
+                      title={selectedClips.has(clip.id) ? 'Deselect' : 'Select for bulk action'}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedClips.has(clip.id)}
+                        onChange={() => toggleClipSelected(clip.id)}
+                        className="w-4 h-4 cursor-pointer accent-primary"
+                      />
+                    </label>
                     <div className="aspect-video bg-muted flex items-center justify-center">
                       {clip.clip_url ? (
                         <video
