@@ -14,8 +14,11 @@ interface GenerateClipsRequest {
     // 'broad': legacy behavior — single Reka call with num_generations up to 3.
     mode?: 'per_event' | 'broad'
     min_event_confidence?: number  // default 0.6
-    pre_roll_seconds?: number       // default 7 (widened from 3 — clips were starting too late)
-    post_roll_seconds?: number      // default 7 (widened from 2 — clips were ending too soon)
+    // When set, applied as a flat override across all events. When unset, each
+    // event type gets a tuned default (see ROLL_DEFAULTS) — e.g. goals get 10s
+    // post-roll for celebrations, kickoffs get 2s pre-roll, etc.
+    pre_roll_seconds?: number
+    post_roll_seconds?: number
     // For short-form mode: manual segment selection
     segment_start?: number
     segment_end?: number
@@ -52,6 +55,32 @@ const EVENT_PROMPTS: Record<string, string> = {
 
 function promptForEvent(ev: DetectedEvent): string {
   return EVENT_PROMPTS[ev.type] || `Capture this ${ev.type.replace(/_/g, ' ')} event clearly.`
+}
+
+// Per-event-type pre/post roll defaults. Reasoning:
+// - Goals deserve the longest post-roll for celebrations (10s).
+// - Saves and shots-on-target need a beat after to see the rebound or restart (6-7s).
+// - Kickoffs are restarts; minimal pre-roll, brief post to see the first pass (2/4).
+// - Fouls need post-roll for the ref's reaction and the free-kick setup (5).
+// - Cards: post-roll matters more than pre-roll — we want to see the player walk away.
+// - Penalties bracket the prep + the kick + the outcome (8/10).
+// - Corners: pre to see the placement, post to see the resolution.
+// User-supplied pre_roll_seconds / post_roll_seconds, when set, override these.
+const ROLL_DEFAULTS: Record<string, { pre: number; post: number }> = {
+  goal:           { pre: 7,  post: 10 },
+  shot:           { pre: 7,  post: 5  },
+  shot_on_target: { pre: 7,  post: 7  },
+  save:           { pre: 6,  post: 6  },
+  corner:         { pre: 5,  post: 8  },
+  kickoff:        { pre: 2,  post: 4  },
+  yellow_card:    { pre: 4,  post: 7  },
+  red_card:       { pre: 4,  post: 8  },
+  foul:           { pre: 5,  post: 5  },
+  penalty:        { pre: 8,  post: 10 },
+}
+const FALLBACK_ROLL = { pre: 7, post: 7 }
+function rollForEventType(type: string): { pre: number; post: number } {
+  return ROLL_DEFAULTS[type] ?? FALLBACK_ROLL
 }
 
 serve(async (req) => {
@@ -177,8 +206,12 @@ serve(async (req) => {
 
     if (usePerEvent) {
       const minConf = settings?.min_event_confidence ?? 0.6
-      const preRoll = settings?.pre_roll_seconds ?? 7
-      const postRoll = settings?.post_roll_seconds ?? 7
+      // When the user explicitly sets pre_roll_seconds/post_roll_seconds, use
+      // that as a flat override. Otherwise look up per-event defaults so each
+      // event type gets framing tuned to its rhythm (goal celebrations vs.
+      // kickoff openers vs. card walk-aways).
+      const userPreRoll = settings?.pre_roll_seconds
+      const userPostRoll = settings?.post_roll_seconds
 
       // PATH A: caller supplied a pre-computed event list (from a prior
       // List Events run). Skip the analyze call entirely.
@@ -290,6 +323,9 @@ serve(async (req) => {
             // Reka requires source_start_time/source_end_time as INTEGERS — fractional
             // seconds (e.g. 131.4) trigger HTTP 400 validation errors. Round outward
             // to slightly widen the window rather than truncate the event.
+            const roll = rollForEventType(ev.type)
+            const preRoll = userPreRoll ?? roll.pre
+            const postRoll = userPostRoll ?? roll.post
             const clipStart = Math.max(0, Math.floor(ev.start - preRoll))
             const clipEnd = Math.ceil(ev.end + postRoll)
             const req = {
