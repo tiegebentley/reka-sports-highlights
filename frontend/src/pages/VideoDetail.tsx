@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 import {
@@ -131,6 +131,11 @@ export function VideoDetail() {
   const [contextOpen, setContextOpen] = useState(false)
   const [contextDraft, setContextDraft] = useState<MatchContext>({})
   const [savingContext, setSavingContext] = useState(false)
+  // Signed URL for the source video so we can preview it inline (main player +
+  // per-row scrubber while editing event timestamps). Resolved once per video.
+  const [sourceVideoUrl, setSourceVideoUrl] = useState<string | null>(null)
+  // Ref to the main source player so the scrubber buttons can read currentTime.
+  const mainVideoRef = useRef<HTMLVideoElement | null>(null)
   const [polling, setPolling] = useState(false)
   const [tagFilter, setTagFilter] = useState<Set<string>>(new Set())
   // Sort modes: time_asc = chronological (event order in source video),
@@ -343,6 +348,34 @@ export function VideoDetail() {
     }
   }, [videoId])
 
+  // Resolve a playable URL for the source video. Storage uploads need a signed
+  // URL (RLS); URL-source videos can be played directly. Re-runs when the video
+  // record changes so a freshly-uploaded one becomes playable without reload.
+  useEffect(() => {
+    let cancelled = false
+    const resolveUrl = async () => {
+      if (!video) return
+      if (video.source_type === 'upload' && video.storage_path) {
+        const { data, error: signErr } = await supabase.storage
+          .from('video-uploads')
+          .createSignedUrl(video.storage_path, 60 * 60 * 6)
+        if (cancelled) return
+        if (signErr || !data?.signedUrl) {
+          console.warn('Could not sign source URL:', signErr?.message)
+          setSourceVideoUrl(null)
+        } else {
+          setSourceVideoUrl(data.signedUrl)
+        }
+      } else if (video.source_url) {
+        setSourceVideoUrl(video.source_url)
+      } else {
+        setSourceVideoUrl(null)
+      }
+    }
+    resolveUrl()
+    return () => { cancelled = true }
+  }, [video?.id, video?.storage_path, video?.source_type, video?.source_url])
+
   const fetchVideoDetails = async () => {
     try {
       setLoading(true)
@@ -554,6 +587,35 @@ export function VideoDetail() {
     setEditedEvents(prev => prev.map((e, i) => (i === idx ? { ...e, ...patch } : e)))
   }
 
+  // Scrubber helpers — bridge the main source video player and the editable
+  // event timestamps so the user can snap edges by eye without typing numbers.
+  const seekMainVideoTo = (seconds: number) => {
+    const v = mainVideoRef.current
+    if (!v) return
+    // Scroll into view on small screens so the user actually sees the seek.
+    try { v.scrollIntoView({ behavior: 'smooth', block: 'center' }) } catch { /* noop */ }
+    v.currentTime = Math.max(0, seconds)
+    // Don't auto-play — let the user click play themselves.
+  }
+
+  const snapEventToCurrentTime = (idx: number, edge: 'start' | 'end') => {
+    const v = mainVideoRef.current
+    if (!v) {
+      alert('Video not loaded yet')
+      return
+    }
+    const t = Number(v.currentTime.toFixed(1))
+    setEditedEvents(prev => prev.map((e, i) => {
+      if (i !== idx) return e
+      if (edge === 'start') {
+        // If new start would push past end, slide end forward to keep a 1s window.
+        return { ...e, start: t, end: Math.max(t + 1, e.end) }
+      }
+      // edge === 'end': enforce end > start.
+      return { ...e, end: Math.max(t, e.start + 0.1) }
+    }))
+  }
+
   // Delete an event row entirely. Indices shift, so we rebuild the selection set.
   const deleteEvent = (idx: number) => {
     setEditedEvents(prev => prev.filter((_, i) => i !== idx))
@@ -762,10 +824,22 @@ export function VideoDetail() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Main Video Section */}
         <div className="lg:col-span-2 space-y-6">
-          {/* Video Player / Thumbnail */}
+          {/* Video Player / Thumbnail. We render a real player so users can
+              scrub the source video to find event timestamps, then snap event
+              start/end to the player's currentTime via buttons in the edit form. */}
           <div className="rounded-lg border bg-card overflow-hidden">
             <div className="aspect-video bg-muted flex items-center justify-center relative">
-              <Video className="w-16 h-16 text-muted-foreground" />
+              {sourceVideoUrl ? (
+                <video
+                  ref={mainVideoRef}
+                  src={sourceVideoUrl}
+                  controls
+                  preload="metadata"
+                  className="w-full h-full object-contain bg-black"
+                />
+              ) : (
+                <Video className="w-16 h-16 text-muted-foreground" />
+              )}
               {video.source_type !== 'upload' && video.source_url && (
                 <a
                   href={video.source_url}
@@ -1096,7 +1170,8 @@ export function VideoDetail() {
                           const isSelected = selectedEventIdx.has(i)
                           const isEditing = editingEventIdx === i
                           if (isEditing) {
-                            // Inline edit form spans the full row.
+                            // Inline edit form spans the full row. Includes scrubber
+                            // controls that read the main video player's currentTime.
                             return (
                               <tr key={i} className="border-b last:border-0 bg-muted/40">
                                 <td className="py-2 pr-3 align-top">
@@ -1108,7 +1183,7 @@ export function VideoDetail() {
                                   />
                                 </td>
                                 <td colSpan={6} className="py-2 pr-3">
-                                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                                  <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
                                     <select
                                       value={evt.type}
                                       onChange={(e) => patchEvent(i, { type: e.target.value })}
@@ -1118,22 +1193,62 @@ export function VideoDetail() {
                                         <option key={t.id} value={t.id}>{t.label}</option>
                                       ))}
                                     </select>
-                                    <input
-                                      type="number"
-                                      step="0.1"
-                                      value={evt.start}
-                                      onChange={(e) => patchEvent(i, { start: Number(e.target.value) })}
-                                      placeholder="Start (s)"
-                                      className="text-xs rounded border border-input bg-background px-2 py-1 font-mono"
-                                    />
-                                    <input
-                                      type="number"
-                                      step="0.1"
-                                      value={evt.end}
-                                      onChange={(e) => patchEvent(i, { end: Number(e.target.value) })}
-                                      placeholder="End (s)"
-                                      className="text-xs rounded border border-input bg-background px-2 py-1 font-mono"
-                                    />
+                                    {/* Start with snap + seek helpers */}
+                                    <div className="flex items-center gap-1">
+                                      <input
+                                        type="number"
+                                        step="0.1"
+                                        value={evt.start}
+                                        onChange={(e) => patchEvent(i, { start: Number(e.target.value) })}
+                                        placeholder="Start (s)"
+                                        className="flex-1 text-xs rounded border border-input bg-background px-2 py-1 font-mono"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() => seekMainVideoTo(evt.start)}
+                                        title="Seek video to this start time"
+                                        className="text-muted-foreground hover:text-foreground p-1 rounded hover:bg-muted"
+                                      >
+                                        <PlayCircle className="w-4 h-4" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => snapEventToCurrentTime(i, 'start')}
+                                        title="Snap start to current video time"
+                                        disabled={!sourceVideoUrl}
+                                        className="text-[10px] rounded-md border border-input bg-background px-2 py-1 hover:bg-muted whitespace-nowrap disabled:opacity-50"
+                                      >
+                                        Snap
+                                      </button>
+                                    </div>
+                                    {/* End with snap + seek helpers */}
+                                    <div className="flex items-center gap-1">
+                                      <input
+                                        type="number"
+                                        step="0.1"
+                                        value={evt.end}
+                                        onChange={(e) => patchEvent(i, { end: Number(e.target.value) })}
+                                        placeholder="End (s)"
+                                        className="flex-1 text-xs rounded border border-input bg-background px-2 py-1 font-mono"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() => seekMainVideoTo(evt.end)}
+                                        title="Seek video to this end time"
+                                        className="text-muted-foreground hover:text-foreground p-1 rounded hover:bg-muted"
+                                      >
+                                        <PlayCircle className="w-4 h-4" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => snapEventToCurrentTime(i, 'end')}
+                                        title="Snap end to current video time"
+                                        disabled={!sourceVideoUrl}
+                                        className="text-[10px] rounded-md border border-input bg-background px-2 py-1 hover:bg-muted whitespace-nowrap disabled:opacity-50"
+                                      >
+                                        Snap
+                                      </button>
+                                    </div>
                                     <input
                                       type="number"
                                       step="0.05"
@@ -1152,6 +1267,11 @@ export function VideoDetail() {
                                     rows={2}
                                     className="w-full mt-2 text-xs rounded border border-input bg-background px-2 py-1 resize-y"
                                   />
+                                  {sourceVideoUrl && (
+                                    <p className="text-[10px] text-muted-foreground mt-1">
+                                      Tip: scrub the main video player above to the moment you want, then click <span className="font-medium">Snap</span> to set start or end.
+                                    </p>
+                                  )}
                                 </td>
                                 <td className="py-2 pr-3 align-top">
                                   <button
@@ -1186,6 +1306,14 @@ export function VideoDetail() {
                               <td className="py-2 pr-3 text-xs">{evt.description}</td>
                               <td className="py-2 pr-3">
                                 <div className="flex items-center gap-1">
+                                  <button
+                                    onClick={() => seekMainVideoTo(evt.start)}
+                                    title="Preview — seek video to this event"
+                                    disabled={!sourceVideoUrl}
+                                    className="text-muted-foreground hover:text-foreground p-1 rounded hover:bg-muted disabled:opacity-50"
+                                  >
+                                    <PlayCircle className="w-3 h-3" />
+                                  </button>
                                   <button
                                     onClick={() => setEditingEventIdx(i)}
                                     title="Edit event"
