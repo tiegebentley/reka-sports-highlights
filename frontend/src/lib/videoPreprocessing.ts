@@ -268,7 +268,7 @@ export async function remuxToFaststartMp4(
     outputName,
   ])
   const data = await ffmpeg.readFile(outputName)
-  const blob = new Blob([data as Uint8Array], { type: 'video/mp4' })
+  const blob = new Blob([data as BlobPart], { type: 'video/mp4' })
   const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4'
   return new File([blob], newName, { type: 'video/mp4' })
 }
