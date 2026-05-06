@@ -141,12 +141,19 @@ export function VideoDetail() {
   const [editingTagsFor, setEditingTagsFor] = useState<string | null>(null)
   const [editingTagsDraft, setEditingTagsDraft] = useState<Set<string>>(new Set())
   const [analyzingEvents, setAnalyzingEvents] = useState(false)
+  type EditableEvent = { type: string; start: number; end: number; description: string; confidence: number }
   const [analyzeEventsResult, setAnalyzeEventsResult] = useState<{
-    events: Array<{ type: string; start: number; end: number; description: string; confidence: number }>
+    events: EditableEvent[]
     rawResponse?: string
     error?: string
     rekaVideoId?: string
   } | null>(null)
+  // Working copy of the event list — user can edit/uncheck/delete/add rows
+  // before clicking "Generate clips from these events". Reset whenever a fresh
+  // analyze-events call returns.
+  const [editedEvents, setEditedEvents] = useState<EditableEvent[]>([])
+  const [selectedEventIdx, setSelectedEventIdx] = useState<Set<number>>(new Set())
+  const [editingEventIdx, setEditingEventIdx] = useState<number | null>(null)
 
   const toggleTagFilter = (tagId: string) => {
     setTagFilter(prev => {
@@ -405,7 +412,15 @@ export function VideoDetail() {
   // Cheaper (no extra Q&A round-trip) and lets the user verify before paying
   // Reka clip credits.
   const handleGenerateFromEvents = async () => {
-    if (!video || !analyzeEventsResult || analyzeEventsResult.events.length === 0) return
+    if (!video) return
+    // Send only the selected + edited events. Validate windows are positive.
+    const eventsToSend = editedEvents
+      .filter((_, i) => selectedEventIdx.has(i))
+      .filter(e => e.end > e.start)
+    if (eventsToSend.length === 0) {
+      alert('Select at least one event with end > start before generating.')
+      return
+    }
     try {
       setGeneratingClips(true)
       const { data, error: generateError } = await supabase.functions.invoke('generate-clips', {
@@ -418,7 +433,7 @@ export function VideoDetail() {
             // Drop confidence filter to 0 — the user already vetted these
             // events by clicking the button, so let them all through.
             min_event_confidence: 0,
-            events: analyzeEventsResult.events,
+            events: eventsToSend,
           },
         },
       })
@@ -502,17 +517,78 @@ export function VideoDetail() {
         throw new Error(bodyText || analyzeError.message || 'Edge function error')
       }
       if (!data?.ok) throw new Error(data?.error || 'Unknown error')
+      const events: EditableEvent[] = data.events || []
       setAnalyzeEventsResult({
-        events: data.events || [],
+        events,
         rawResponse: data.rawResponse,
         rekaVideoId: data.rekaVideoId,
       })
+      // Seed editable copy + select-all by default. User can uncheck before generating.
+      setEditedEvents(events.map(e => ({ ...e })))
+      setSelectedEventIdx(new Set(events.map((_, i) => i)))
+      setEditingEventIdx(null)
     } catch (err: any) {
       console.error('Error analyzing events:', err)
       setAnalyzeEventsResult({ events: [], error: err.message || String(err) })
     } finally {
       setAnalyzingEvents(false)
     }
+  }
+
+  // ─── Event-list editing helpers ──────────────────────────────────────
+  // Selection: which events get sent to generate-clips. Defaults to all
+  // after analyze runs; user can uncheck before generating.
+  const toggleEventSelected = (idx: number) => {
+    setSelectedEventIdx(prev => {
+      const next = new Set(prev)
+      if (next.has(idx)) next.delete(idx)
+      else next.add(idx)
+      return next
+    })
+  }
+  const selectAllEvents = () => setSelectedEventIdx(new Set(editedEvents.map((_, i) => i)))
+  const deselectAllEvents = () => setSelectedEventIdx(new Set())
+
+  // Edit-in-place: patch a single event field. Used by the inline edit form.
+  const patchEvent = (idx: number, patch: Partial<EditableEvent>) => {
+    setEditedEvents(prev => prev.map((e, i) => (i === idx ? { ...e, ...patch } : e)))
+  }
+
+  // Delete an event row entirely. Indices shift, so we rebuild the selection set.
+  const deleteEvent = (idx: number) => {
+    setEditedEvents(prev => prev.filter((_, i) => i !== idx))
+    setSelectedEventIdx(prev => {
+      const next = new Set<number>()
+      for (const i of prev) {
+        if (i < idx) next.add(i)
+        else if (i > idx) next.add(i - 1)
+        // i === idx → drop it
+      }
+      return next
+    })
+    setEditingEventIdx(prev => (prev === idx ? null : prev !== null && prev > idx ? prev - 1 : prev))
+  }
+
+  // Add a blank event row at the end. User fills it in via the inline edit form.
+  const addBlankEvent = () => {
+    setEditedEvents(prev => {
+      // Default to a tiny window after the last event so timestamps don't collide.
+      const last = prev[prev.length - 1]
+      const start = last ? Math.ceil(last.end) + 1 : 0
+      const newEvt: EditableEvent = {
+        type: 'goal',
+        start,
+        end: start + 5,
+        description: '',
+        confidence: 0.8,
+      }
+      const next = [...prev, newEvt]
+      // Auto-select + open edit on the new row.
+      const newIdx = next.length - 1
+      setSelectedEventIdx(s => new Set([...s, newIdx]))
+      setEditingEventIdx(newIdx)
+      return next
+    })
   }
 
   const handlePollJobs = async () => {
@@ -965,32 +1041,139 @@ export function VideoDetail() {
                     <p className="font-mono text-xs whitespace-pre-wrap">{analyzeEventsResult.error}</p>
                   </div>
                 </div>
-              ) : analyzeEventsResult.events.length === 0 ? (
+              ) : editedEvents.length === 0 ? (
                 <div className="space-y-3">
-                  <p className="text-sm text-muted-foreground">
-                    No events parsed from response. Reka may have returned non-JSON output. Raw response:
-                  </p>
-                  <pre className="text-xs bg-muted p-3 rounded overflow-auto max-h-64">{analyzeEventsResult.rawResponse}</pre>
+                  {analyzeEventsResult.events.length === 0 ? (
+                    <>
+                      <p className="text-sm text-muted-foreground">
+                        No events parsed from response. Reka may have returned non-JSON output. Raw response:
+                      </p>
+                      <pre className="text-xs bg-muted p-3 rounded overflow-auto max-h-64">{analyzeEventsResult.rawResponse}</pre>
+                    </>
+                  ) : (
+                    <p className="text-sm text-muted-foreground italic">
+                      All events were deleted. Add a new event below or re-run List Events.
+                    </p>
+                  )}
+                  <button
+                    onClick={addBlankEvent}
+                    className="text-xs rounded-md border border-dashed border-input px-3 py-2 hover:bg-muted flex items-center gap-1"
+                  >
+                    <Plus className="w-3 h-3" /> Add event manually
+                  </button>
                 </div>
               ) : (
                 <div className="space-y-2">
+                  {/* Selection summary + bulk-select controls */}
+                  <div className="flex items-center gap-3 text-xs text-muted-foreground pb-2">
+                    <span>
+                      <span className="font-medium text-foreground">{selectedEventIdx.size}</span> of {editedEvents.length} selected
+                    </span>
+                    {selectedEventIdx.size < editedEvents.length && (
+                      <button onClick={selectAllEvents} className="hover:text-foreground underline">Select all</button>
+                    )}
+                    {selectedEventIdx.size > 0 && (
+                      <button onClick={deselectAllEvents} className="hover:text-foreground underline">Deselect all</button>
+                    )}
+                  </div>
                   <div className="overflow-x-auto">
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="text-left border-b">
+                          <th className="py-2 pr-3 w-8"></th>
                           <th className="py-2 pr-3">Type</th>
                           <th className="py-2 pr-3">Start</th>
                           <th className="py-2 pr-3">End</th>
                           <th className="py-2 pr-3">Duration</th>
                           <th className="py-2 pr-3">Confidence</th>
                           <th className="py-2 pr-3">Description</th>
+                          <th className="py-2 pr-3 w-20"></th>
                         </tr>
                       </thead>
                       <tbody>
-                        {analyzeEventsResult.events.map((evt, i) => {
+                        {editedEvents.map((evt, i) => {
                           const tag = TAG_BY_ID[evt.type as keyof typeof TAG_BY_ID]
+                          const isSelected = selectedEventIdx.has(i)
+                          const isEditing = editingEventIdx === i
+                          if (isEditing) {
+                            // Inline edit form spans the full row.
+                            return (
+                              <tr key={i} className="border-b last:border-0 bg-muted/40">
+                                <td className="py-2 pr-3 align-top">
+                                  <input
+                                    type="checkbox"
+                                    checked={isSelected}
+                                    onChange={() => toggleEventSelected(i)}
+                                    className="w-4 h-4 cursor-pointer accent-primary"
+                                  />
+                                </td>
+                                <td colSpan={6} className="py-2 pr-3">
+                                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                                    <select
+                                      value={evt.type}
+                                      onChange={(e) => patchEvent(i, { type: e.target.value })}
+                                      className="text-xs rounded border border-input bg-background px-2 py-1"
+                                    >
+                                      {SOCCER_TAGS.map(t => (
+                                        <option key={t.id} value={t.id}>{t.label}</option>
+                                      ))}
+                                    </select>
+                                    <input
+                                      type="number"
+                                      step="0.1"
+                                      value={evt.start}
+                                      onChange={(e) => patchEvent(i, { start: Number(e.target.value) })}
+                                      placeholder="Start (s)"
+                                      className="text-xs rounded border border-input bg-background px-2 py-1 font-mono"
+                                    />
+                                    <input
+                                      type="number"
+                                      step="0.1"
+                                      value={evt.end}
+                                      onChange={(e) => patchEvent(i, { end: Number(e.target.value) })}
+                                      placeholder="End (s)"
+                                      className="text-xs rounded border border-input bg-background px-2 py-1 font-mono"
+                                    />
+                                    <input
+                                      type="number"
+                                      step="0.05"
+                                      min={0}
+                                      max={1}
+                                      value={evt.confidence}
+                                      onChange={(e) => patchEvent(i, { confidence: Number(e.target.value) })}
+                                      placeholder="Confidence"
+                                      className="text-xs rounded border border-input bg-background px-2 py-1 font-mono"
+                                    />
+                                  </div>
+                                  <textarea
+                                    value={evt.description}
+                                    onChange={(e) => patchEvent(i, { description: e.target.value })}
+                                    placeholder="Description"
+                                    rows={2}
+                                    className="w-full mt-2 text-xs rounded border border-input bg-background px-2 py-1 resize-y"
+                                  />
+                                </td>
+                                <td className="py-2 pr-3 align-top">
+                                  <button
+                                    onClick={() => setEditingEventIdx(null)}
+                                    className="text-xs rounded-md bg-primary px-2 py-1 text-primary-foreground hover:bg-primary/90 inline-flex items-center gap-1"
+                                  >
+                                    <Check className="w-3 h-3" /> Done
+                                  </button>
+                                </td>
+                              </tr>
+                            )
+                          }
                           return (
-                            <tr key={i} className="border-b last:border-0">
+                            <tr key={i} className={`border-b last:border-0 ${!isSelected ? 'opacity-50' : ''}`}>
+                              <td className="py-2 pr-3">
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={() => toggleEventSelected(i)}
+                                  className="w-4 h-4 cursor-pointer accent-primary"
+                                />
+                              </td>
                               <td className="py-2 pr-3">
                                 <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs border ${tag?.cls || 'bg-muted text-muted-foreground border-border'}`}>
                                   {tag?.label || evt.type}
@@ -1001,21 +1184,46 @@ export function VideoDetail() {
                               <td className="py-2 pr-3 font-mono text-xs">{(evt.end - evt.start).toFixed(1)}s</td>
                               <td className="py-2 pr-3 font-mono text-xs">{(evt.confidence * 100).toFixed(0)}%</td>
                               <td className="py-2 pr-3 text-xs">{evt.description}</td>
+                              <td className="py-2 pr-3">
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    onClick={() => setEditingEventIdx(i)}
+                                    title="Edit event"
+                                    className="text-muted-foreground hover:text-foreground p-1 rounded hover:bg-muted"
+                                  >
+                                    <Pencil className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    onClick={() => deleteEvent(i)}
+                                    title="Delete event"
+                                    className="text-muted-foreground hover:text-destructive p-1 rounded hover:bg-muted"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              </td>
                             </tr>
                           )
                         })}
                       </tbody>
                     </table>
                   </div>
-                  {/* Primary action: generate clips from this exact event list. Skips the
-                      analyze-events call inside generate-clips so we don't pay for Q&A twice. */}
+                  <div className="pt-1">
+                    <button
+                      onClick={addBlankEvent}
+                      className="text-xs rounded-md border border-dashed border-input px-3 py-1.5 hover:bg-muted flex items-center gap-1 text-muted-foreground hover:text-foreground"
+                    >
+                      <Plus className="w-3 h-3" /> Add event manually
+                    </button>
+                  </div>
+                  {/* Primary action: generate clips from the selected, edited event list. */}
                   <div className="flex items-center justify-between gap-3 pt-3 mt-3 border-t">
                     <p className="text-xs text-muted-foreground flex-1">
-                      Review the events above. When ready, generate one clip per event using the verified list.
+                      Uncheck rows you don't want clipped, edit timestamps with the pencil icon, or add events manually. Only selected events become clips.
                     </p>
                     <button
                       onClick={handleGenerateFromEvents}
-                      disabled={generatingClips || hasActiveJobs}
+                      disabled={generatingClips || hasActiveJobs || selectedEventIdx.size === 0}
                       className="rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 whitespace-nowrap"
                     >
                       {generatingClips ? (
@@ -1031,7 +1239,7 @@ export function VideoDetail() {
                       ) : (
                         <>
                           <Scissors className="w-4 h-4" />
-                          Generate {analyzeEventsResult.events.length} clip{analyzeEventsResult.events.length === 1 ? '' : 's'} from these events
+                          Generate {selectedEventIdx.size} clip{selectedEventIdx.size === 1 ? '' : 's'}
                         </>
                       )}
                     </button>
