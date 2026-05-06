@@ -61,6 +61,48 @@ interface AnalyzeEventsRequest {
   videoId: string
 }
 
+// Optional per-video match context. Lives on videos.metadata.match_context.
+// Every field optional — we only inject sections that are filled in.
+interface MatchContext {
+  team_a_name?: string
+  team_a_colors?: string  // free-form, e.g. "white shirts with black shorts"
+  team_a_keeper_color?: string
+  team_b_name?: string
+  team_b_colors?: string
+  team_b_keeper_color?: string
+  final_score?: string    // free-form, e.g. "Wasatch 4 - 2 Barca"
+  half_length_minutes?: number
+  field_orientation?: string  // e.g. "Wasatch attacks left-to-right in first half"
+  notes?: string          // catch-all for anything else
+}
+
+// Render a MATCH CONTEXT preamble that gets prepended to the Reka prompt.
+// Returns empty string if no context is set, so the prompt is unchanged for
+// videos without a filled-in context form.
+function buildContextPreamble(ctx: MatchContext | null | undefined): string {
+  if (!ctx) return ''
+  const lines: string[] = []
+  const teamABits: string[] = []
+  if (ctx.team_a_name) teamABits.push(ctx.team_a_name)
+  if (ctx.team_a_colors) teamABits.push(`wears ${ctx.team_a_colors}`)
+  if (ctx.team_a_keeper_color) teamABits.push(`goalkeeper in ${ctx.team_a_keeper_color}`)
+  if (teamABits.length) lines.push(`- Team A: ${teamABits.join(', ')}.`)
+
+  const teamBBits: string[] = []
+  if (ctx.team_b_name) teamBBits.push(ctx.team_b_name)
+  if (ctx.team_b_colors) teamBBits.push(`wears ${ctx.team_b_colors}`)
+  if (ctx.team_b_keeper_color) teamBBits.push(`goalkeeper in ${ctx.team_b_keeper_color}`)
+  if (teamBBits.length) lines.push(`- Team B: ${teamBBits.join(', ')}.`)
+
+  if (ctx.final_score) lines.push(`- Final score: ${ctx.final_score}. Use this as a sanity check — the total goals you list should match this score (do not invent goals to reach it; report what you actually see).`)
+  if (ctx.half_length_minutes) lines.push(`- Halves: two ${ctx.half_length_minutes}-minute halves. Expect a second-half kickoff event around the ${ctx.half_length_minutes}-minute mark.`)
+  if (ctx.field_orientation) lines.push(`- Field orientation: ${ctx.field_orientation}.`)
+  if (ctx.notes) lines.push(`- Additional notes: ${ctx.notes}`)
+
+  if (lines.length === 0) return ''
+  return `MATCH CONTEXT — use this to attribute events to the correct team and player. When describing an event, refer to teams BY NAME (not by jersey color) and reference jersey numbers when visible:\n${lines.join('\n')}\n\n`
+}
+
 interface ParsedEvent {
   type: string
   start: number
@@ -177,9 +219,18 @@ serve(async (req) => {
       await new Promise((r) => setTimeout(r, 3000))
     }
 
+    // Build the prompt with optional match context prepended. The preamble is
+    // empty when nothing is set, so unanchored videos see the bare EVENT_PROMPT.
+    const matchContext: MatchContext | null = video.metadata?.match_context ?? null
+    const contextPreamble = buildContextPreamble(matchContext)
+    const finalPrompt = contextPreamble + EVENT_PROMPT
+    if (contextPreamble) {
+      console.log(`[analyze-events] Injecting match context (${contextPreamble.length} chars)`)
+    }
+
     // Run Q&A
     console.log(`[analyze-events] Running Q&A on Reka video_id ${rekaVideoId}`)
-    const responseText = await rekaClient.videoQA(rekaVideoId!, EVENT_PROMPT)
+    const responseText = await rekaClient.videoQA(rekaVideoId!, finalPrompt)
     const { events, raw } = parseEventsFromResponse(responseText)
 
     return new Response(

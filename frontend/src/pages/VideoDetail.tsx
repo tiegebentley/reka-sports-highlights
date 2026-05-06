@@ -44,6 +44,25 @@ type SourceType = 'upload' | 'youtube' | 'twitch'
 type ProcessingMode = 'sports_analysis' | 'short_form'
 type AspectRatio = '1:1' | '4:5' | '9:16' | '16:9'
 
+interface MatchContext {
+  team_a_name?: string
+  team_a_colors?: string
+  team_a_keeper_color?: string
+  team_b_name?: string
+  team_b_colors?: string
+  team_b_keeper_color?: string
+  final_score?: string
+  half_length_minutes?: number
+  field_orientation?: string
+  notes?: string
+}
+
+interface VideoMetadata {
+  reka_video_id?: string
+  reka_upload_response?: any
+  match_context?: MatchContext
+}
+
 interface VideoRecord {
   id: string
   user_id: string
@@ -55,6 +74,7 @@ interface VideoRecord {
   resolution: string | null
   status: VideoStatus
   processing_mode: ProcessingMode // NEW: determines clip generation workflow
+  metadata: VideoMetadata | null
   created_at: string
   updated_at: string
 }
@@ -107,6 +127,10 @@ export function VideoDetail() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [generatingClips, setGeneratingClips] = useState(false)
+  // Match context form state — edited locally, persisted on save.
+  const [contextOpen, setContextOpen] = useState(false)
+  const [contextDraft, setContextDraft] = useState<MatchContext>({})
+  const [savingContext, setSavingContext] = useState(false)
   const [polling, setPolling] = useState(false)
   const [tagFilter, setTagFilter] = useState<Set<string>>(new Set())
   // Sort modes: time_asc = chronological (event order in source video),
@@ -227,6 +251,40 @@ export function VideoDetail() {
     setTagAddOpenFor(null)
   }
 
+  // Save the match context form. Strips empty strings so we don't persist
+  // junk into metadata. Merges into existing metadata to preserve reka_video_id.
+  const saveMatchContext = async () => {
+    if (!video) return
+    setSavingContext(true)
+    // Strip empty values so the JSON stays small and the prompt preamble
+    // doesn't get sections that say "Team A: ." with nothing.
+    const cleaned: MatchContext = {}
+    for (const [k, v] of Object.entries(contextDraft)) {
+      if (typeof v === 'string') {
+        const trimmed = v.trim()
+        if (trimmed) (cleaned as any)[k] = trimmed
+      } else if (typeof v === 'number' && !isNaN(v)) {
+        (cleaned as any)[k] = v
+      }
+    }
+    const nextMetadata: VideoMetadata = {
+      ...(video.metadata ?? {}),
+      match_context: Object.keys(cleaned).length > 0 ? cleaned : undefined,
+    }
+    const { error: saveErr } = await supabase
+      .from('videos')
+      .update({ metadata: nextMetadata })
+      .eq('id', video.id)
+    if (saveErr) {
+      console.error('Failed to save match context:', saveErr.message)
+      alert(`Save failed: ${saveErr.message}`)
+    } else {
+      setVideo({ ...video, metadata: nextMetadata })
+      setContextOpen(false)
+    }
+    setSavingContext(false)
+  }
+
   const deleteSelectedClips = async () => {
     if (selectedClips.size === 0 || bulkDeleting) return
     const ids = Array.from(selectedClips)
@@ -304,6 +362,9 @@ export function VideoDetail() {
       }
 
       setVideo(videoData)
+      // Seed the context form from persisted metadata so reopening the panel
+      // shows whatever was last saved.
+      setContextDraft(videoData?.metadata?.match_context ?? {})
 
       // Fetch clips
       const { data: clipsData, error: clipsError } = await supabase
@@ -634,6 +695,149 @@ export function VideoDetail() {
                   <span className="text-muted-foreground">Clips</span>
                   <p className="font-medium">{clips.length}</p>
                 </div>
+              </div>
+
+              {/* Match Context — optional. When set, the analyze-events Reka prompt
+                  is augmented so descriptions reference team names + jersey numbers
+                  instead of color guesses. Significant accuracy boost. */}
+              <div className="mt-6 rounded-md border bg-background/50">
+                <button
+                  type="button"
+                  onClick={() => setContextOpen(o => !o)}
+                  className="w-full flex items-center justify-between px-4 py-3 hover:bg-muted/50 transition-colors text-left"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium">Match Context</span>
+                    {video.metadata?.match_context && Object.keys(video.metadata.match_context).length > 0 ? (
+                      <span className="text-xs text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1">
+                        <CheckCircle2 className="w-3 h-3" /> Set
+                      </span>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">Optional — improves event detection</span>
+                    )}
+                  </div>
+                  <span className="text-xs text-muted-foreground">{contextOpen ? 'Hide' : 'Edit'}</span>
+                </button>
+
+                {contextOpen && (
+                  <div className="px-4 pb-4 space-y-3 border-t pt-4">
+                    <p className="text-xs text-muted-foreground">
+                      Telling Reka who's on the field cuts wrong-team attributions and lets descriptions name actual teams instead of guessing colors. All fields optional.
+                    </p>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {/* Team A */}
+                      <div className="space-y-2">
+                        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Team A</h4>
+                        <input
+                          type="text"
+                          placeholder="Team name (e.g. Wasatch Elite-JS)"
+                          value={contextDraft.team_a_name ?? ''}
+                          onChange={(e) => setContextDraft(d => ({ ...d, team_a_name: e.target.value }))}
+                          className="w-full text-sm rounded-md border border-input bg-background px-3 py-2"
+                        />
+                        <input
+                          type="text"
+                          placeholder="Jersey colors (e.g. white shirts, black shorts)"
+                          value={contextDraft.team_a_colors ?? ''}
+                          onChange={(e) => setContextDraft(d => ({ ...d, team_a_colors: e.target.value }))}
+                          className="w-full text-sm rounded-md border border-input bg-background px-3 py-2"
+                        />
+                        <input
+                          type="text"
+                          placeholder="Goalkeeper color (e.g. neon yellow)"
+                          value={contextDraft.team_a_keeper_color ?? ''}
+                          onChange={(e) => setContextDraft(d => ({ ...d, team_a_keeper_color: e.target.value }))}
+                          className="w-full text-sm rounded-md border border-input bg-background px-3 py-2"
+                        />
+                      </div>
+
+                      {/* Team B */}
+                      <div className="space-y-2">
+                        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Team B</h4>
+                        <input
+                          type="text"
+                          placeholder="Team name (e.g. L30 Barca)"
+                          value={contextDraft.team_b_name ?? ''}
+                          onChange={(e) => setContextDraft(d => ({ ...d, team_b_name: e.target.value }))}
+                          className="w-full text-sm rounded-md border border-input bg-background px-3 py-2"
+                        />
+                        <input
+                          type="text"
+                          placeholder="Jersey colors (e.g. navy, with red trim)"
+                          value={contextDraft.team_b_colors ?? ''}
+                          onChange={(e) => setContextDraft(d => ({ ...d, team_b_colors: e.target.value }))}
+                          className="w-full text-sm rounded-md border border-input bg-background px-3 py-2"
+                        />
+                        <input
+                          type="text"
+                          placeholder="Goalkeeper color"
+                          value={contextDraft.team_b_keeper_color ?? ''}
+                          onChange={(e) => setContextDraft(d => ({ ...d, team_b_keeper_color: e.target.value }))}
+                          className="w-full text-sm rounded-md border border-input bg-background px-3 py-2"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2">
+                      <input
+                        type="text"
+                        placeholder="Final score (e.g. Wasatch 4 - 2 Barca)"
+                        value={contextDraft.final_score ?? ''}
+                        onChange={(e) => setContextDraft(d => ({ ...d, final_score: e.target.value }))}
+                        className="text-sm rounded-md border border-input bg-background px-3 py-2"
+                      />
+                      <input
+                        type="number"
+                        min={1}
+                        max={45}
+                        placeholder="Half length (minutes)"
+                        value={contextDraft.half_length_minutes ?? ''}
+                        onChange={(e) => {
+                          const n = e.target.value === '' ? undefined : Number(e.target.value)
+                          setContextDraft(d => ({ ...d, half_length_minutes: n }))
+                        }}
+                        className="text-sm rounded-md border border-input bg-background px-3 py-2"
+                      />
+                    </div>
+
+                    <input
+                      type="text"
+                      placeholder="Field orientation (e.g. Wasatch attacks left-to-right in first half)"
+                      value={contextDraft.field_orientation ?? ''}
+                      onChange={(e) => setContextDraft(d => ({ ...d, field_orientation: e.target.value }))}
+                      className="w-full text-sm rounded-md border border-input bg-background px-3 py-2"
+                    />
+
+                    <textarea
+                      rows={2}
+                      placeholder="Additional notes (key player numbers, weather, etc.)"
+                      value={contextDraft.notes ?? ''}
+                      onChange={(e) => setContextDraft(d => ({ ...d, notes: e.target.value }))}
+                      className="w-full text-sm rounded-md border border-input bg-background px-3 py-2 resize-y"
+                    />
+
+                    <div className="flex gap-2 pt-2">
+                      <button
+                        onClick={saveMatchContext}
+                        disabled={savingContext}
+                        className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center gap-2"
+                      >
+                        {savingContext ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                        Save context
+                      </button>
+                      <button
+                        onClick={() => {
+                          setContextDraft(video.metadata?.match_context ?? {})
+                          setContextOpen(false)
+                        }}
+                        className="rounded-md border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-muted transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="flex gap-3 mt-6">
