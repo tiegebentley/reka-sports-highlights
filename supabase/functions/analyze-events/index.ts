@@ -8,22 +8,54 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, content-type, apikey',
 }
 
-const EVENT_PROMPT = `You are a soccer match analyst. Watch this video and list every notable event with precise start and end timestamps in seconds. Events to identify: goal, shot, shot_on_target, save, corner, kickoff, yellow_card, red_card, foul, penalty.
+const EVENT_PROMPT = `You are a soccer match analyst. Watch this video and list notable events with precise start and end timestamps in seconds.
 
-Respond ONLY with a JSON array, no prose. Each entry must have:
+EVENT TYPES — pick exactly ONE per event, using these strict definitions:
+
+- "goal": The ball FULLY CROSSES THE GOAL LINE between the posts AND under the crossbar AND play stops to restart at the centre circle. If you cannot see the ball cross the line, OR the goalkeeper/defender stops it, OR play continues without a centre-circle restart, it is NOT a goal.
+- "shot_on_target": A shot that was heading on goal but did NOT score — saved, blocked on the line, or hit the frame and stayed out. Use this when there's a save or near-miss on frame.
+- "shot": A shot that missed the goal entirely (wide, over, or off target). Do NOT use "shot" if it scored (use "goal") or was saved (use "shot_on_target").
+- "save": The goalkeeper actively stops a shot. Use this when the keeper is the focus. (A shot that was saved should produce ONE event — usually "save", or "shot_on_target" if the keeper is incidental.)
+- "corner": A corner kick is taken (ball placed at the corner flag, kicked into the box).
+- "kickoff": Match start, second-half start, or a restart from the centre circle after a goal.
+- "yellow_card": Referee visibly shows a yellow card.
+- "red_card": Referee visibly shows a red card.
+- "foul": A clear foul whistled by the referee resulting in a free kick (no card shown).
+- "penalty": A penalty kick is taken from the spot.
+
+EXCLUSION RULES — these combinations are FORBIDDEN. Do NOT emit two events for the same moment:
+- A save means the ball did NOT enter the net. Never emit "goal" and "save" for the same moment.
+- A goal means the shot was not stopped. Never emit "goal" and "shot_on_target" for the same moment.
+- A foul stops play; emit "foul" OR "yellow_card"/"red_card", not both unless the card is shown clearly.
+- A penalty kick can be followed by either a "goal" OR a "save" event (separate timestamps), but the penalty itself is one event.
+
+CONFIDENCE CALIBRATION — be HONEST about uncertainty:
+- 0.90-1.00: You can see the action clearly and the outcome is unambiguous.
+- 0.70-0.89: You're fairly sure but the camera angle or speed makes it slightly ambiguous.
+- 0.50-0.69: You suspect this happened but a key detail (ball crossing line, contact made) wasn't visible.
+- Below 0.50: Do NOT include the event.
+
+OUTPUT — Respond ONLY with a JSON array, no prose. Each entry must have:
 - "type": one of the event types above
 - "start": start time in seconds (decimal allowed, e.g. 134.5)
 - "end": end time in seconds (decimal allowed)
-- "description": one short sentence describing what happened
-- "confidence": 0.0-1.0 confidence score
+- "description": one short sentence describing what happened, including outcome (e.g. "scored", "saved", "missed wide")
+- "confidence": 0.0-1.0 per the calibration above
 
-Example:
+EXAMPLES showing the rules in action:
+
 [
-  {"type": "goal", "start": 142.3, "end": 158.7, "description": "Player #10 scores from outside the box, top-right corner", "confidence": 0.95},
-  {"type": "save", "start": 213.1, "end": 218.4, "description": "Goalkeeper dives left to deflect a low shot", "confidence": 0.88}
+  {"type": "kickoff", "start": 2.0, "end": 5.5, "description": "Match kicks off from the centre circle", "confidence": 0.97},
+  {"type": "shot", "start": 87.2, "end": 90.1, "description": "Player shoots from outside the box but the ball goes wide of the right post", "confidence": 0.90},
+  {"type": "save", "start": 142.3, "end": 146.7, "description": "Goalkeeper dives left and parries a low driven shot for a corner", "confidence": 0.92},
+  {"type": "corner", "start": 152.0, "end": 156.4, "description": "Corner kick swung in from the left flag", "confidence": 0.95},
+  {"type": "goal", "start": 213.1, "end": 220.5, "description": "Striker heads the ball into the bottom-right corner; the ball clearly crosses the line and the team celebrates", "confidence": 0.96},
+  {"type": "foul", "start": 305.8, "end": 308.2, "description": "Midfielder fouls the attacker; referee blows whistle for a free kick, no card", "confidence": 0.85}
 ]
 
-Be exhaustive. Include every event you see. If unsure, lower the confidence score but still include the event.`
+Notice: at 142.3 the goalkeeper saved the shot — emitted ONE "save" event, NOT a "goal" or a separate "shot_on_target". At 87.2 the shot missed wide — emitted "shot", NOT "shot_on_target". At 213.1 the ball clearly crossed the line — emitted "goal".
+
+QUALITY OVER QUANTITY. Only include events you can actually verify on the video. It is better to miss an ambiguous event than to fabricate one. If a shot's outcome (saved vs scored vs missed) isn't visible, emit "shot" with low confidence rather than guessing "goal".`
 
 interface AnalyzeEventsRequest {
   videoId: string
