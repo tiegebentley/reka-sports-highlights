@@ -209,6 +209,9 @@ export function VideoDetail() {
   const [compiling, setCompiling] = useState(false)
   const [compileStatus, setCompileStatus] = useState<string>('')
   const [compileProgress, setCompileProgress] = useState<number>(0)
+  // Transition mode for the reel. Crossfade (default) is smooth but slower
+  // (re-encodes); hard cuts use stream-copy where possible (much faster).
+  const [reelTransition, setReelTransition] = useState<'crossfade' | 'hard'>('crossfade')
 
   const toggleClipSelected = (clipId: string) => {
     setSelectedClips(prev => {
@@ -341,6 +344,7 @@ export function VideoDetail() {
         urls,
         (msg) => setCompileStatus(msg),
         (ratio) => setCompileProgress(Math.max(0, Math.min(1, ratio))),
+        { transition: reelTransition, crossfadeSeconds: 0.4 },
       )
       // Trigger a download.
       const url = URL.createObjectURL(blob)
@@ -1578,6 +1582,16 @@ export function VideoDetail() {
                     </button>
 
                     <div className="ml-auto flex items-center gap-2">
+                      <select
+                        value={reelTransition}
+                        onChange={(e) => setReelTransition(e.target.value as 'crossfade' | 'hard')}
+                        disabled={compiling}
+                        title="Crossfade is smoother but re-encodes (slower). Hard cuts stream-copy (fast)."
+                        className="text-xs rounded border border-input bg-background px-2 py-1 disabled:opacity-50"
+                      >
+                        <option value="crossfade">Crossfade</option>
+                        <option value="hard">Hard cuts</option>
+                      </select>
                       <button
                         onClick={compileSelectedReel}
                         disabled={compiling || selectedClips.size === 0}

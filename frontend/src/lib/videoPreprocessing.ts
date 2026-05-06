@@ -273,25 +273,69 @@ export async function remuxToFaststartMp4(
   return new File([blob], newName, { type: 'video/mp4' })
 }
 
+// Duration probe via the browser's <video> element. Used by the crossfade path
+// to compute xfade offsets without ffprobe (which isn't in ffmpeg.wasm).
+async function probeDurationFromBlob(blob: Blob): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob)
+    const v = document.createElement('video')
+    v.preload = 'metadata'
+    v.onloadedmetadata = () => {
+      const d = v.duration
+      URL.revokeObjectURL(url)
+      // Some MP4s with mis-set or missing moov return NaN/Infinity. Treat that
+      // as a probe failure so the caller can fall back to hard-cut concat.
+      if (!isFinite(d) || d <= 0) {
+        reject(new Error('Could not probe video duration'))
+      } else {
+        resolve(d)
+      }
+    }
+    v.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('Failed to load video for duration probe'))
+    }
+    v.src = url
+  })
+}
+
+export interface CompileReelOptions {
+  /**
+   * 'crossfade' (default) — adds smooth fade transitions between clips.
+   * Forces a re-encode pass; takes longer but produces a much nicer reel.
+   *
+   * 'hard' — concat demuxer with stream-copy. Fast but no transitions.
+   */
+  transition?: 'crossfade' | 'hard'
+  /** Crossfade length in seconds. Ignored for 'hard'. */
+  crossfadeSeconds?: number
+}
+
 /**
- * Concatenate a sequence of clip URLs into a single MP4 reel using the
- * ffmpeg concat demuxer. Tries stream-copy first (fast, no re-encode); on
- * failure (e.g. mismatched codecs/parameters) falls back to re-encoding to
- * H.264/AAC so the output always plays.
+ * Concatenate a sequence of clip URLs into a single MP4 reel using ffmpeg.wasm.
  *
- * Clips are downloaded sequentially. Total time roughly:
- *   downloads + (~2s per clip for stream-copy) + (~5-10s/clip for re-encode).
+ * Modes:
+ *   - 'crossfade' (default): re-encodes with xfade + acrossfade between clips.
+ *     Probes each clip's duration first via <video> metadata, then builds an
+ *     xfade chain. Falls back to hard cuts if duration probing fails.
+ *   - 'hard': uses the concat demuxer with `-c copy` for fastest output.
+ *     Falls back to a re-encode concat if codecs differ.
  *
  * Returns a Blob the caller can pipe into a download link or upload.
  */
 export async function compileReelFromUrls(
   clipUrls: string[],
   onStatus?: (msg: string) => void,
-  onProgress?: (ratio: number) => void
+  onProgress?: (ratio: number) => void,
+  opts: CompileReelOptions = {},
 ): Promise<Blob> {
+  const transition: 'crossfade' | 'hard' = opts.transition ?? 'crossfade'
+  // Default crossfade duration — short enough that no real action is hidden,
+  // long enough to be perceptually smooth.
+  const xfadeSeconds = Math.max(0.1, Math.min(2, opts.crossfadeSeconds ?? 0.4))
+
   if (clipUrls.length === 0) throw new Error('No clips to compile')
   if (clipUrls.length === 1) {
-    // Trivial case — just fetch the one clip and return it.
     onStatus?.('Fetching single clip…')
     const r = await fetch(clipUrls[0])
     if (!r.ok) throw new Error(`Failed to fetch clip: ${r.status}`)
@@ -312,20 +356,97 @@ export async function compileReelFromUrls(
     wasmURL: `${origin}/ffmpeg/ffmpeg-core.wasm`,
   })
 
-  // Download each clip and write into the FFmpeg virtual FS.
+  // Download each clip into both the FFmpeg virtual FS AND keep the Blob so
+  // we can probe duration in the browser. Two birds, one fetch.
   const inputNames: string[] = []
+  const blobs: Blob[] = []
   for (let i = 0; i < clipUrls.length; i++) {
     onStatus?.(`Downloading clip ${i + 1} of ${clipUrls.length}…`)
+    const r = await fetch(clipUrls[i])
+    if (!r.ok) throw new Error(`Failed to fetch clip ${i + 1}: ${r.status}`)
+    const blob = await r.blob()
     const name = `in${i.toString().padStart(3, '0')}.mp4`
-    await ffmpeg.writeFile(name, await fetchFile(clipUrls[i]))
+    await ffmpeg.writeFile(name, await fetchFile(blob))
     inputNames.push(name)
+    blobs.push(blob)
   }
 
-  // Build the concat demuxer manifest. Each line: file '<filename>'.
+  const outputName = 'reel.mp4'
+
+  // ─── Crossfade path ──────────────────────────────────────────────────
+  if (transition === 'crossfade' && clipUrls.length >= 2) {
+    try {
+      onStatus?.('Probing clip durations…')
+      const durations: number[] = []
+      for (let i = 0; i < blobs.length; i++) {
+        durations.push(await probeDurationFromBlob(blobs[i]))
+      }
+
+      // Cap fade against the shortest clip — xfade fade time must be ≤ each
+      // adjacent clip's duration or the filter errors.
+      const shortest = Math.min(...durations)
+      const fade = Math.min(xfadeSeconds, Math.max(0.1, shortest / 2))
+
+      // Build the xfade chain. Offsets are cumulative duration minus i*fade
+      // (each crossfade overlaps its two neighbors by `fade` seconds, so the
+      // running output shortens by `fade` for every transition).
+      // For inputs with durations d0,d1,d2,... the offset for the i-th xfade
+      // (joining accumulated[v...] with input i+1) is:
+      //   offset_i = (sum d0..di) - (i+1)*fade
+      const N = inputNames.length
+      const videoFilters: string[] = []
+      const audioFilters: string[] = []
+      let cumulative = durations[0]
+      let lastVLabel = '[0:v]'
+      let lastALabel = '[0:a]'
+      for (let i = 1; i < N; i++) {
+        const offset = (cumulative - fade).toFixed(3)
+        const outV = i === N - 1 ? '[vout]' : `[v${i}]`
+        const outA = i === N - 1 ? '[aout]' : `[a${i}]`
+        videoFilters.push(
+          `${lastVLabel}[${i}:v]xfade=transition=fade:duration=${fade.toFixed(3)}:offset=${offset}${outV}`
+        )
+        audioFilters.push(
+          `${lastALabel}[${i}:a]acrossfade=d=${fade.toFixed(3)}${outA}`
+        )
+        lastVLabel = outV
+        lastALabel = outA
+        cumulative += durations[i] - fade
+      }
+      const filterComplex = [...videoFilters, ...audioFilters].join(';')
+
+      const args: string[] = []
+      for (const name of inputNames) {
+        args.push('-i', name)
+      }
+      args.push(
+        '-filter_complex', filterComplex,
+        '-map', '[vout]',
+        '-map', '[aout]',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-movflags', '+faststart',
+        outputName,
+      )
+
+      onStatus?.(`Stitching ${N} clips with ${fade.toFixed(2)}s crossfades…`)
+      await ffmpeg.exec(args)
+      const data = await ffmpeg.readFile(outputName)
+      return new Blob([data as BlobPart], { type: 'video/mp4' })
+    } catch (e) {
+      console.warn('Crossfade compile failed, falling back to hard concat:', e)
+      onStatus?.('Crossfade failed — using hard cuts…')
+      // fall through to hard-concat path below
+    }
+  }
+
+  // ─── Hard-cut path (concat demuxer) ──────────────────────────────────
+  // Default for transition='hard', or fallback when crossfade fails.
   const manifest = inputNames.map(n => `file '${n}'`).join('\n')
   await ffmpeg.writeFile('concat.txt', new TextEncoder().encode(manifest))
-
-  const outputName = 'reel.mp4'
 
   // Path A: stream copy. Works when all clips share codec + parameters.
   onStatus?.('Stitching clips (fast path)…')
