@@ -74,8 +74,12 @@ interface ClipRecord {
   aspect_ratio: AspectRatio | null
   resolution: string | null
   processing_mode: ProcessingMode // NEW: sports_analysis or short_form
-  segment_start: number | null // NEW: for short_form mode manual selection
-  segment_end: number | null // NEW: for short_form mode manual selection
+  segment_start: number | null // for short_form mode manual selection AND per-event source window
+  segment_end: number | null
+  // Per-event mode: source event metadata persisted by poll-clip-jobs.
+  event_type: string | null
+  event_description: string | null
+  event_confidence: number | null
   created_at: string
 }
 
@@ -104,6 +108,11 @@ export function VideoDetail() {
   const [generatingClips, setGeneratingClips] = useState(false)
   const [polling, setPolling] = useState(false)
   const [tagFilter, setTagFilter] = useState<Set<string>>(new Set())
+  // Sort modes: time_asc = chronological (event order in source video),
+  // score_desc = highest-quality first (best clips). Default to chronological
+  // because that's how the filter UI currently presents counts.
+  type ClipSort = 'time_asc' | 'time_desc' | 'score_desc' | 'score_asc'
+  const [clipSort, setClipSort] = useState<ClipSort>('time_asc')
   const [editingTagsFor, setEditingTagsFor] = useState<string | null>(null)
   const [editingTagsDraft, setEditingTagsDraft] = useState<Set<string>>(new Set())
   const [analyzingEvents, setAnalyzingEvents] = useState(false)
@@ -174,6 +183,15 @@ export function VideoDetail() {
     }
   }
 
+  // Format seconds (possibly fractional) as "m:ss" — e.g. 132.5 → "2:12".
+  const fmtSourceTime = (s: number | null | undefined): string | null => {
+    if (s == null || !isFinite(s)) return null
+    const total = Math.max(0, Math.floor(s))
+    const m = Math.floor(total / 60)
+    const sec = total % 60
+    return `${m}:${sec.toString().padStart(2, '0')}`
+  }
+
   const removeTagFromClip = (clipId: string, tagId: string) => {
     const clip = clips.find(c => c.id === clipId)
     if (!clip) return
@@ -194,14 +212,31 @@ export function VideoDetail() {
   }
 
   // Apply filter: clip passes if it carries every active filter tag (AND match).
-  // Empty filter shows everything.
-  const filteredClips = tagFilter.size === 0
-    ? clips
-    : clips.filter(c => {
-        const ct = c.tags ?? []
-        for (const t of tagFilter) if (!ct.includes(t)) return false
-        return true
-      })
+  // Empty filter shows everything. Then sort by chosen order.
+  const filteredClips = (() => {
+    const filtered = tagFilter.size === 0
+      ? clips
+      : clips.filter(c => {
+          const ct = c.tags ?? []
+          for (const t of tagFilter) if (!ct.includes(t)) return false
+          return true
+        })
+    const arr = [...filtered]
+    // Sort comparator. nulls sink (undefined treated as -Infinity for desc, +Infinity for asc).
+    const cmpNum = (a: number | null | undefined, b: number | null | undefined, asc: boolean) => {
+      const av = a == null ? (asc ? Infinity : -Infinity) : a
+      const bv = b == null ? (asc ? Infinity : -Infinity) : b
+      return asc ? av - bv : bv - av
+    }
+    switch (clipSort) {
+      case 'time_asc':   arr.sort((a, b) => cmpNum(a.segment_start, b.segment_start, true)); break
+      case 'time_desc':  arr.sort((a, b) => cmpNum(a.segment_start, b.segment_start, false)); break
+      // score_desc = best first; tiebreak by event_confidence
+      case 'score_desc': arr.sort((a, b) => cmpNum(a.quality_score, b.quality_score, false) || cmpNum(a.event_confidence, b.event_confidence, false)); break
+      case 'score_asc':  arr.sort((a, b) => cmpNum(a.quality_score, b.quality_score, true)  || cmpNum(a.event_confidence, b.event_confidence, true)); break
+    }
+    return arr
+  })()
 
   useEffect(() => {
     if (videoId) {
@@ -765,6 +800,20 @@ export function VideoDetail() {
                       Clear
                     </button>
                   )}
+                  <div className="ml-auto flex items-center gap-2">
+                    <label className="text-xs text-muted-foreground" htmlFor="clip-sort">Sort:</label>
+                    <select
+                      id="clip-sort"
+                      value={clipSort}
+                      onChange={(e) => setClipSort(e.target.value as ClipSort)}
+                      className="text-xs rounded border border-input bg-background px-2 py-1"
+                    >
+                      <option value="time_asc">Chronological</option>
+                      <option value="time_desc">Reverse chronological</option>
+                      <option value="score_desc">Best first (score)</option>
+                      <option value="score_asc">Lowest score first</option>
+                    </select>
+                  </div>
                 </div>
 
                 {filteredClips.length === 0 && (
@@ -812,6 +861,23 @@ export function VideoDetail() {
                           </span>
                         )}
                       </div>
+
+                      {/* Source timestamp — when in the source video this clip was extracted from.
+                          Shown as "m:ss → m:ss" for cross-referencing against the original video. */}
+                      {(() => {
+                        const startStr = fmtSourceTime(clip.segment_start)
+                        const endStr = fmtSourceTime(clip.segment_end)
+                        if (!startStr) return null
+                        return (
+                          <div className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
+                            <Clock className="w-3 h-3" />
+                            <span className="font-mono">{startStr}{endStr && ` → ${endStr}`}</span>
+                            {clip.event_confidence != null && (
+                              <span className="ml-2 opacity-70">conf {Math.round(clip.event_confidence * 100)}%</span>
+                            )}
+                          </div>
+                        )
+                      })()}
 
                       {/* Event tags — pills replace caption/hashtags as primary metadata. */}
                       {editingTagsFor === clip.id ? (
