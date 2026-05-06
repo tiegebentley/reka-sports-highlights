@@ -75,12 +75,25 @@ export class RekaClient {
       },
     })
 
+    const rawBody = await response.text()
+
     if (!response.ok) {
-      const errorBody = await response.text()
-      throw new Error(`Reka API error (${response.status}): ${errorBody}`)
+      throw new Error(`Reka API error (${response.status}): ${rawBody}`)
     }
 
-    return await response.json()
+    let parsed: RekaClipResponse
+    try {
+      parsed = JSON.parse(rawBody)
+    } catch (e) {
+      console.error(`[Reka] getClipStatus(${clipId}) returned non-JSON body:`, rawBody)
+      throw new Error(`Reka returned non-JSON body: ${rawBody.slice(0, 500)}`)
+    }
+
+    // Always log the full payload so we can diagnose `failed` statuses with no `error` field
+    // and inspect any undocumented fields Reka returns (progress, internal codes, etc.).
+    console.log(`[Reka] getClipStatus(${clipId}) full payload:`, JSON.stringify(parsed))
+
+    return parsed
   }
 
   async pollClipCompletion(

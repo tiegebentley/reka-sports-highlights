@@ -10,10 +10,43 @@ interface GenerateClipsRequest {
     aspect_ratio?: '9:16' | '16:9' | '4:5' | '1:1'
     resolution?: number
     prompt?: string
+    // 'per_event' (default for sports_analysis): detect events first, then clip each one individually.
+    // 'broad': legacy behavior — single Reka call with num_generations up to 3.
+    mode?: 'per_event' | 'broad'
+    min_event_confidence?: number  // default 0.6
+    pre_roll_seconds?: number       // default 7 (widened from 3 — clips were starting too late)
+    post_roll_seconds?: number      // default 7 (widened from 2 — clips were ending too soon)
     // For short-form mode: manual segment selection
     segment_start?: number
     segment_end?: number
+    max_duration_seconds?: number
+    subtitles?: boolean
   }
+}
+
+interface DetectedEvent {
+  type: string
+  start: number
+  end: number
+  description: string
+  confidence: number
+}
+
+const EVENT_PROMPTS: Record<string, string> = {
+  goal: 'Capture this goal with the build-up and the celebration that follows.',
+  shot: 'Capture this shot attempt with the build-up and the goalkeeper or defensive reaction.',
+  shot_on_target: 'Capture this shot on target with the build-up and goalkeeper save or block.',
+  save: 'Capture this goalkeeper save with a moment of build-up before the shot.',
+  yellow_card: 'Capture the foul and the referee issuing the yellow card.',
+  red_card: 'Capture the foul and the referee issuing the red card.',
+  foul: 'Capture the foul and the immediate aftermath.',
+  penalty: 'Capture the foul that led to the penalty and the penalty kick itself.',
+  corner: 'Capture this corner kick from the delivery to the resolution.',
+  kickoff: 'Capture this kickoff and the opening play that follows.',
+}
+
+function promptForEvent(ev: DetectedEvent): string {
+  return EVENT_PROMPTS[ev.type] || `Capture this ${ev.type.replace(/_/g, ' ')} event clearly.`
 }
 
 serve(async (req) => {
@@ -124,6 +157,216 @@ serve(async (req) => {
     if (processingMode === 'short_form' && !settings?.aspect_ratio) {
       // For short-form without explicit settings, this will be set per-clip by the frontend
       aspectRatio = '9:16' // default
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PER-EVENT MODE: detect events via analyze-events first, then fan out one
+    // tight Reka /v1/clips call per event. Yields one clip per discrete moment
+    // (goal, save, card, etc.) instead of 3 broad highlight reels.
+    // ─────────────────────────────────────────────────────────────────────────
+    const explicitSegment_perEvent = settings?.segment_start !== undefined && settings?.segment_end !== undefined
+    const usePerEvent =
+      processingMode === 'sports_analysis' &&
+      !explicitSegment_perEvent &&
+      (settings?.mode ?? 'per_event') === 'per_event'
+
+    if (usePerEvent) {
+      const minConf = settings?.min_event_confidence ?? 0.6
+      const preRoll = settings?.pre_roll_seconds ?? 7
+      const postRoll = settings?.post_roll_seconds ?? 7
+
+      console.log(`[per-event] Invoking analyze-events for video ${videoId}`)
+      const analyzeResp = await fetch(`${supabaseUrl}/functions/v1/analyze-events`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${supabaseServiceKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ videoId }),
+      })
+
+      if (!analyzeResp.ok) {
+        const errBody = await analyzeResp.text()
+        await supabase
+          .from('jobs')
+          .update({
+            status: 'failed',
+            error: `analyze-events failed (${analyzeResp.status}): ${errBody.slice(0, 500)}`,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', job.id)
+        await supabase.from('videos').update({ status: 'uploaded' }).eq('id', videoId)
+        throw new Error(`analyze-events failed: ${errBody.slice(0, 200)}`)
+      }
+
+      const analyzeJson = await analyzeResp.json() as {
+        ok: boolean
+        events?: DetectedEvent[]
+        error?: string
+      }
+
+      if (!analyzeJson.ok || !Array.isArray(analyzeJson.events)) {
+        await supabase
+          .from('jobs')
+          .update({
+            status: 'failed',
+            error: `analyze-events returned no events: ${analyzeJson.error || 'unknown'}`,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', job.id)
+        await supabase.from('videos').update({ status: 'uploaded' }).eq('id', videoId)
+        throw new Error(`analyze-events returned no events`)
+      }
+
+      const allEvents = analyzeJson.events
+      const events = allEvents
+        .filter((e) => e.confidence >= minConf)
+        .filter((e) => e.end > e.start)
+        .sort((a, b) => a.start - b.start)
+
+      console.log(`[per-event] analyze-events returned ${allEvents.length} events; ${events.length} pass confidence ≥ ${minConf}`)
+
+      if (events.length === 0) {
+        await supabase
+          .from('jobs')
+          .update({
+            status: 'failed',
+            error: `No events detected at confidence ≥ ${minConf}. Total returned: ${allEvents.length}.`,
+            metadata: {
+              ...job.metadata,
+              per_event: true,
+              events_total: allEvents.length,
+              events_kept: 0,
+              all_events: allEvents,
+            },
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', job.id)
+        await supabase.from('videos').update({ status: 'uploaded' }).eq('id', videoId)
+        throw new Error('No events detected above confidence threshold')
+      }
+
+      // Fan out one Reka /v1/clips call per event with a tight time window.
+      // Throttle in batches of 5 to stay polite with Reka rate limits.
+      const BATCH = 5
+      type EventCall =
+        | { ok: true; event: DetectedEvent; id: string; status: string; clipStart: number; clipEnd: number }
+        | { ok: false; event: DetectedEvent; error: string; clipStart: number; clipEnd: number }
+
+      const settled: EventCall[] = []
+      for (let i = 0; i < events.length; i += BATCH) {
+        const batch = events.slice(i, i + BATCH)
+        const batchResults: EventCall[] = await Promise.all(
+          batch.map(async (ev) => {
+            // Reka requires source_start_time/source_end_time as INTEGERS — fractional
+            // seconds (e.g. 131.4) trigger HTTP 400 validation errors. Round outward
+            // to slightly widen the window rather than truncate the event.
+            const clipStart = Math.max(0, Math.floor(ev.start - preRoll))
+            const clipEnd = Math.ceil(ev.end + postRoll)
+            const req = {
+              video_urls: [videoUrl],
+              prompt: promptForEvent(ev),
+              generation_config: {
+                template: 'moments',
+                num_generations: 1,
+                max_duration_seconds: Math.min(90, Math.ceil(clipEnd - clipStart) + 10),
+                source_start_time: clipStart,
+                source_end_time: clipEnd,
+              },
+              rendering_config: {
+                aspect_ratio: aspectRatio,
+                resolution: settings?.resolution || 720,
+                subtitles: settings?.subtitles ?? true,
+              },
+            }
+            try {
+              const resp = await rekaClient.generateClips(req)
+              console.log(`[per-event] ${ev.type} ${ev.start.toFixed(1)}-${ev.end.toFixed(1)}s → reka_id=${resp.id}`)
+              return { ok: true as const, event: ev, id: resp.id, status: resp.status, clipStart, clipEnd }
+            } catch (e) {
+              const errMsg = e instanceof Error ? e.message : String(e)
+              console.error(`[per-event] ${ev.type} ${ev.start.toFixed(1)}s failed: ${errMsg}`)
+              return { ok: false as const, event: ev, error: errMsg, clipStart, clipEnd }
+            }
+          })
+        )
+        settled.push(...batchResults)
+      }
+
+      const successes = settled.filter((s): s is Extract<EventCall, { ok: true }> => s.ok)
+      const failures = settled.filter((s): s is Extract<EventCall, { ok: false }> => !s.ok)
+
+      if (successes.length === 0) {
+        const errSummary = failures.slice(0, 5).map((f) => `${f.event.type}@${f.event.start.toFixed(1)}: ${f.error}`).join('; ')
+        await supabase
+          .from('jobs')
+          .update({
+            status: 'failed',
+            error: `All ${failures.length} per-event Reka calls failed: ${errSummary}`,
+            metadata: {
+              ...job.metadata,
+              per_event: true,
+              events_total: allEvents.length,
+              events_kept: events.length,
+              event_failures: failures.map((f) => ({ event: f.event, error: f.error })),
+            },
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', job.id)
+        await supabase.from('videos').update({ status: 'uploaded' }).eq('id', videoId)
+        throw new Error(`All per-event calls failed: ${errSummary}`)
+      }
+
+      // Persist segments in the same shape poll-clip-jobs already understands,
+      // augmented with event metadata so the poller can attach it to clip rows.
+      const rekaClipIds = successes.map((s) => ({
+        id: s.id,
+        start: s.clipStart,
+        end: s.clipEnd,
+        status: s.status,
+        event_type: s.event.type,
+        event_description: s.event.description,
+        event_confidence: s.event.confidence,
+      }))
+
+      const { error: updateErr } = await supabase
+        .from('jobs')
+        .update({
+          metadata: {
+            ...job.metadata,
+            reka_clip_ids: rekaClipIds,
+            reka_status: 'processing',
+            per_event: true,
+            multi_segment: true,
+            events_total: allEvents.length,
+            events_kept: events.length,
+            event_failures: failures.length > 0 ? failures.map((f) => ({ event: f.event, error: f.error })) : undefined,
+          },
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', job.id)
+      if (updateErr) {
+        console.error(`[Job ${job.id}] Failed to persist per-event reka_clip_ids:`, updateErr.message)
+      }
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          jobId: job.id,
+          mode: 'per_event',
+          eventsDetected: allEvents.length,
+          eventsKept: events.length,
+          rekaCallsStarted: successes.length,
+          rekaCallsFailed: failures.length,
+          message: `Per-event clipping started for ${successes.length}/${events.length} events.`,
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        }
+      )
     }
 
     // Generate clips with Reka

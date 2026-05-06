@@ -40,10 +40,19 @@ serve(async (req) => {
 
     for (const job of jobs || []) {
       try {
-        // Multi-segment jobs persist an array of {id, start, end, status}.
+        // Multi-segment jobs persist an array of {id, start, end, status, ...event metadata}.
+        // Per-event jobs additionally carry event_type/description/confidence per segment so
+        // we can tag each inserted clip row with the originating event.
         // Legacy single-segment jobs persist a string reka_clip_id.
-        const rekaClipIds: Array<{ id: string; start?: number; end?: number; status?: string }> | undefined =
-          job.metadata?.reka_clip_ids
+        const rekaClipIds: Array<{
+          id: string
+          start?: number
+          end?: number
+          status?: string
+          event_type?: string
+          event_description?: string
+          event_confidence?: number
+        }> | undefined = job.metadata?.reka_clip_ids
         const legacyRekaClipId: string | undefined = job.metadata?.reka_clip_id
 
         if (!rekaClipIds && !legacyRekaClipId) {
@@ -77,9 +86,23 @@ serve(async (req) => {
         const aspectRatio = job.result?.aspectRatio || '9:16'
 
         // Build a uniform list of segments to poll
-        type SegmentToPoll = { id: string; start?: number; end?: number }
+        type SegmentToPoll = {
+          id: string
+          start?: number
+          end?: number
+          event_type?: string
+          event_description?: string
+          event_confidence?: number
+        }
         const segmentsToPoll: SegmentToPoll[] = rekaClipIds
-          ? rekaClipIds.map((s) => ({ id: s.id, start: s.start, end: s.end }))
+          ? rekaClipIds.map((s) => ({
+              id: s.id,
+              start: s.start,
+              end: s.end,
+              event_type: s.event_type,
+              event_description: s.event_description,
+              event_confidence: s.event_confidence,
+            }))
           : [
               {
                 id: legacyRekaClipId!,
@@ -89,35 +112,47 @@ serve(async (req) => {
             ]
 
         type SegResult =
-          | { ok: true; segment: SegmentToPoll; clips: any[]; rekaStatus: string }
-          | { ok: false; segment: SegmentToPoll; rekaStatus: string; error?: string; payload?: any }
-          | { ok: 'pending'; segment: SegmentToPoll; rekaStatus: string }
+          | { ok: true; segment: SegmentToPoll; clips: any[]; rekaStatus: string; payload: any }
+          | { ok: false; segment: SegmentToPoll; rekaStatus: string; error?: string; payload: any }
+          | { ok: 'pending'; segment: SegmentToPoll; rekaStatus: string; payload: any }
 
         const segResults: SegResult[] = await Promise.all(
           segmentsToPoll.map(async (seg) => {
             try {
               const status = await rekaClient.getClipStatus(seg.id)
-              console.log(`[Reka] Clip ${seg.id} (${seg.start ?? '?'}-${seg.end ?? '?'}s) status:`, status.status)
+              console.log(
+                `[Reka] Clip ${seg.id} (${seg.start ?? '?'}-${seg.end ?? '?'}s) status=${status.status} keys=${Object.keys(status).join(',')}`
+              )
               if (status.status === 'completed') {
-                return { ok: true as const, segment: seg, clips: status.output || [], rekaStatus: status.status }
+                return { ok: true as const, segment: seg, clips: status.output || [], rekaStatus: status.status, payload: status }
               } else if (status.status === 'failed') {
+                console.error(`[Reka] Segment ${seg.id} FAILED — raw payload:`, JSON.stringify(status))
                 return {
                   ok: false as const,
                   segment: seg,
                   rekaStatus: status.status,
-                  error: status.error || `Reka failure with no error field`,
+                  error: status.error || `Reka failure with no error field (see payload)`,
                   payload: status,
                 }
               } else {
-                return { ok: 'pending' as const, segment: seg, rekaStatus: status.status }
+                return { ok: 'pending' as const, segment: seg, rekaStatus: status.status, payload: status }
               }
             } catch (e) {
               const errMsg = e instanceof Error ? e.message : String(e)
               console.error(`[Reka] Poll error for ${seg.id}:`, errMsg)
-              return { ok: 'pending' as const, segment: seg, rekaStatus: 'error' }
+              return { ok: 'pending' as const, segment: seg, rekaStatus: 'error', payload: { error: errMsg } }
             }
           })
         )
+
+        // Snapshot the latest raw Reka payload for every segment on every poll so we
+        // can inspect from SQL while the job is still processing — not just terminal.
+        const lastRekaSnapshot = segResults.map((r) => ({
+          segment: r.segment,
+          status: r.rekaStatus,
+          payload: r.payload,
+          polled_at: new Date().toISOString(),
+        }))
 
         const completedSegs = segResults.filter((r): r is Extract<SegResult, { ok: true }> => r.ok === true)
         const failedSegs = segResults.filter((r): r is Extract<SegResult, { ok: false }> => r.ok === false)
@@ -147,6 +182,7 @@ serve(async (req) => {
               title: clip.title,
               caption: clip.caption,
               hashtags: clip.hashtags,
+              anchor: seg.segment.event_type ?? null,
             })
             const { error: insertErr } = await supabase.from('clips').insert({
               video_id: job.video_id,
@@ -162,6 +198,9 @@ serve(async (req) => {
               aspect_ratio: aspectRatio,
               segment_start: seg.segment.start,
               segment_end: seg.segment.end,
+              event_type: seg.segment.event_type ?? null,
+              event_description: seg.segment.event_description ?? null,
+              event_confidence: seg.segment.event_confidence ?? null,
             })
             if (insertErr) {
               console.error(`Failed to insert clip from segment ${seg.segment.id}:`, insertErr.message)
@@ -190,8 +229,9 @@ serve(async (req) => {
                 metadata: {
                   ...job.metadata,
                   reka_status: 'completed',
+                  last_reka_status_payload: lastRekaSnapshot,
                   segment_failures: failedSegs.length > 0
-                    ? failedSegs.map((f) => ({ segment: f.segment, error: f.error }))
+                    ? failedSegs.map((f) => ({ segment: f.segment, error: f.error, payload: f.payload }))
                     : undefined,
                 },
                 updated_at: new Date().toISOString(),
@@ -218,6 +258,7 @@ serve(async (req) => {
                 metadata: {
                   ...job.metadata,
                   reka_status: 'failed',
+                  last_reka_status_payload: lastRekaSnapshot,
                   segment_failures: failedSegs.map((f) => ({ segment: f.segment, error: f.error, payload: f.payload })),
                 },
                 updated_at: new Date().toISOString(),
@@ -237,6 +278,7 @@ serve(async (req) => {
               metadata: {
                 ...job.metadata,
                 reka_status: 'processing',
+                last_reka_status_payload: lastRekaSnapshot,
                 segments_completed: completedSegs.length,
                 segments_failed: failedSegs.length,
                 segments_pending: pendingSegs.length,
