@@ -17,6 +17,7 @@ import {
   Pencil,
   Check,
   X,
+  Plus,
 } from 'lucide-react'
 
 // Soccer event taxonomy. Each tag has a label + Tailwind colour token used
@@ -153,6 +154,43 @@ export function VideoDetail() {
   const cancelEditingTags = () => {
     setEditingTagsFor(null)
     setEditingTagsDraft(new Set())
+  }
+
+  // Inline single-tag mutation. Optimistic update with rollback on DB error.
+  // Used for one-click verification — click ×  to remove, click + popover to add.
+  const [tagAddOpenFor, setTagAddOpenFor] = useState<string | null>(null)
+
+  const mutateClipTags = async (clipId: string, nextTags: string[]) => {
+    const prevSnapshot = clips
+    // optimistic
+    setClips(prev => prev.map(c => c.id === clipId ? { ...c, tags: nextTags } : c))
+    const { error: saveErr } = await supabase
+      .from('clips')
+      .update({ tags: nextTags })
+      .eq('id', clipId)
+    if (saveErr) {
+      console.error('Failed to update tags:', saveErr.message)
+      setClips(prevSnapshot)  // rollback
+    }
+  }
+
+  const removeTagFromClip = (clipId: string, tagId: string) => {
+    const clip = clips.find(c => c.id === clipId)
+    if (!clip) return
+    const nextTags = (clip.tags ?? []).filter(t => t !== tagId)
+    mutateClipTags(clipId, nextTags)
+  }
+
+  const addTagToClip = (clipId: string, tagId: string) => {
+    const clip = clips.find(c => c.id === clipId)
+    if (!clip) return
+    const current = clip.tags ?? []
+    if (current.includes(tagId)) return
+    // Preserve canonical order from SOCCER_TAGS so display order stays stable.
+    const nextSet = new Set([...current, tagId])
+    const nextTags = SOCCER_TAGS.filter(t => nextSet.has(t.id)).map(t => t.id)
+    mutateClipTags(clipId, nextTags)
+    setTagAddOpenFor(null)
   }
 
   // Apply filter: clip passes if it carries every active filter tag (AND match).
@@ -810,26 +848,77 @@ export function VideoDetail() {
                           </div>
                         </div>
                       ) : (
-                        <div className="flex flex-wrap items-center gap-1 mb-3">
+                        <div className="flex flex-wrap items-center gap-1 mb-3 relative">
                           {(clip.tags && clip.tags.length > 0) ? (
                             clip.tags.map(tagId => {
                               const t = TAG_BY_ID[tagId]
                               if (!t) return null
                               return (
-                                <span key={tagId} className={`text-xs px-2 py-1 rounded border ${t.cls}`}>
+                                <span
+                                  key={tagId}
+                                  className={`group/tag text-xs pl-2 pr-1 py-1 rounded border ${t.cls} flex items-center gap-1`}
+                                >
                                   {t.label}
+                                  <button
+                                    onClick={() => removeTagFromClip(clip.id, tagId)}
+                                    aria-label={`Remove ${t.label} tag`}
+                                    title={`Remove ${t.label}`}
+                                    className="opacity-50 hover:opacity-100 hover:bg-black/10 rounded-sm p-0.5 transition-opacity"
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </button>
                                 </span>
                               )
                             })
                           ) : (
                             <span className="text-xs text-muted-foreground italic">No tags</span>
                           )}
+                          {/* Inline add: click + to open a popover of remaining tags. */}
+                          {(() => {
+                            const current = new Set(clip.tags ?? [])
+                            const addable = SOCCER_TAGS.filter(t => !current.has(t.id))
+                            if (addable.length === 0) return null
+                            const isOpen = tagAddOpenFor === clip.id
+                            return (
+                              <div className="relative">
+                                <button
+                                  onClick={() => setTagAddOpenFor(isOpen ? null : clip.id)}
+                                  aria-label="Add tag"
+                                  title="Add tag"
+                                  className="text-xs px-1.5 py-1 rounded border border-dashed border-muted-foreground/40 text-muted-foreground hover:border-foreground hover:text-foreground flex items-center"
+                                >
+                                  <Plus className="w-3 h-3" />
+                                </button>
+                                {isOpen && (
+                                  <>
+                                    {/* click-away catcher */}
+                                    <div
+                                      className="fixed inset-0 z-10"
+                                      onClick={() => setTagAddOpenFor(null)}
+                                    />
+                                    <div className="absolute z-20 left-0 top-full mt-1 bg-popover border rounded-md shadow-lg p-1.5 flex flex-wrap gap-1 w-56">
+                                      {addable.map(t => (
+                                        <button
+                                          key={t.id}
+                                          onClick={() => addTagToClip(clip.id, t.id)}
+                                          className={`text-xs px-2 py-1 rounded border ${t.cls} hover:opacity-80`}
+                                        >
+                                          {t.label}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </>
+                                )}
+                              </div>
+                            )
+                          })()}
                           <button
                             onClick={() => startEditingTags(clip)}
+                            aria-label="Bulk edit tags"
+                            title="Bulk edit"
                             className="ml-auto text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
                           >
                             <Pencil className="w-3 h-3" />
-                            Edit
                           </button>
                         </div>
                       )}
